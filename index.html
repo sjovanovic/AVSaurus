@@ -1,0 +1,157 @@
+<!doctype html>
+<html>
+  <head>
+    <style>
+    html,
+    body {
+      height: 100%;
+      overflow: hidden;
+    }
+    body { /* can also be whatever container */
+      display: flex;
+      display: -webkit-flex;
+      display: flex;
+      -webkit-align-items: center;
+      align-items: center;
+      -webkit-justify-content: center;
+      justify-content: center;
+    }
+    #status_div{
+      font-family: sans-serif;
+      padding: 0px;
+      font-size: 3.2rem;
+      font-weight: 700;
+      font-family: sans-serif;
+    }
+    </style>
+    <script src="js/multipart.js"></script>
+    <script src="js/audioRecorder.js"></script>
+    <script src="js/callbackManager.js"></script>
+    <script src="js/avsaurus.js"></script>
+  </head>
+  <body>
+    <script>
+
+    // AVSaurus
+    function startAvsaurus(token){
+      if(window.avs){
+        return window.avs.setAccessToken(token)
+      }
+      var avs = window.avs = new AVSaurus({
+        'wakewords':[{
+          id:'COMPUTER',
+          pronounce: 'K AH M P Y UW T ER' // from http://www.speech.cs.cmu.edu/cgi-bin/cmudict
+        }],
+        'wakewordSensitivity':"1e-60"
+      })
+      avs.setAccessToken(token)
+
+      // DOM stuff
+      avs.on('ready', function(){
+        if(!this.statusDiv){
+          var dv = document.createElement('div')
+          dv.id = 'status_div'
+          this.statusDiv = dv
+          document.body.appendChild(dv)
+        }
+        this.sound(87.31, 'sine')
+        this.statusDiv.innerHTML = 'I\'m listening... (say: <i>computer, what\'s up?</i>)'
+      })
+
+      avs.on('wakeword', function(){
+        this.sound(440.0, 'sine')
+        this.statusDiv.innerHTML = 'You called?'
+      })
+
+      avs.on('sending', function(){
+        this.statusDiv.innerHTML = 'Asking Alexa...'
+      })
+
+      avs.on('talking', function(){
+        this.statusDiv.innerHTML = 'talking...'
+      })
+
+      avs.on('token_expired', function(){
+        loadAmazonLogin()
+      })
+
+      /**
+       * Some browsers (like Safari) won't allow sounds to play
+       * if it isn't triggered by an onclick event
+       * @param  {Function} onclickFunction function to call during onclick event
+       * @return {undefined}
+       */
+      avs.on('click_confirm', function(onclickFunction){
+        var dv = document.createElement('button')
+        dv.id = 'confirm_play_btn'
+        dv.style.left = '10px'
+        dv.innerHTML = 'Play the response'
+        dv.onclick = function(){
+          dv.parentNode.removeChild(dv)
+          onclickFunction()
+        }
+        document.body.appendChild(dv)
+      })
+
+    }
+
+    </script>
+
+    <!-- amazon login below -->
+    <div id="amazon-root"></div>
+    <script type="text/javascript">
+
+      // clientID and productID of your Alexsa AVS app.
+      // note that the domain where this file is hosted needs to be in your app's "Allowed origins"
+      // and the url must be in "Allowed return URLs" in your app's Security Profile
+      var clientID = 'YOUR CLIENT ID GOES HERE'
+      var productID = 'YOUR PRODUCT ID GOES HERE'
+
+      window.onAmazonLoginReady = function() {
+        amazon.Login.setClientId(clientID);
+        //amazon.Login.setSandboxMode(true)
+        var deviceId = localStorage.getItem('alexa_deviceId')
+        if(!deviceId){
+          deviceId = (Math.random() +'').substring(2)
+          localStorage.setItem('alexa_deviceId', deviceId)
+        }
+        var options = {
+          scope : 'alexa:all',
+          scope_data:{
+            'alexa:all':{
+              "productID" : productID,
+              "productInstanceAttributes": { "deviceSerialNumber" : deviceId }
+            }
+          },
+          popup: false
+        };
+        var returnUrl = location.href.split('#')[0]
+        amazon.Login.authorize(options, returnUrl);
+      };
+      window.loadAmazonLogin = function() {
+        var d = window.document;
+        var a = d.createElement('script'); a.type = 'text/javascript';
+        a.async = true; a.id = 'amazon-login-sdk';
+        a.src = 'https://api-cdn.amazon.com/sdk/login1.js';
+        d.getElementById('amazon-root').appendChild(a);
+      }
+      var urlParams;
+      (window.onpopstate = function () {
+        var match,
+            pl     = /\+/g,  // Regex for replacing addition symbol with a space
+            search = /([^&=]+)=?([^&]*)/g,
+            decode = function (s) { return decodeURIComponent(s.replace(pl, " ")); },
+            query  = window.location.hash.substring(1);
+        urlParams = {};
+        while (match = search.exec(query)){urlParams[decode(match[1])] = decode(match[2]);}
+
+        if(urlParams.access_token){
+          startAvsaurus(urlParams.access_token)
+        }else{
+          loadAmazonLogin()
+        }
+      })();
+
+    </script>
+  </body>
+</html>
