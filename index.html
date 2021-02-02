@@ -115,30 +115,23 @@
 
     </script>
 
-    <!-- amazon login below -->
+
+    
     <div id="amazon-root"></div>
     <script type="text/javascript">
-
-      // clientID and productID of your Alexsa AVS app.
-      // note that the domain where this file is hosted needs to be in your app's "Allowed origins"
-      // and the url must be in "Allowed return URLs" in your app's Security Profile
-      
-      //var clientID = 'YOUR CLIENT ID GOES HERE'
-      //var productID = 'YOUR PRODUCT ID GOES HERE'
 
       var clientID = 'amzn1.application-oa2-client.49e731244394490ab92c260cfd8131e2'
       var productID = 'AVSaurus'
 
-
       window.onAmazonLoginReady = function() {
         amazon.Login.setClientId(clientID);
-        //amazon.Login.setSandboxMode(true)
         var deviceId = localStorage.getItem('alexa_deviceId')
         if(!deviceId){
           deviceId = (Math.random() +'').substring(2)
           localStorage.setItem('alexa_deviceId', deviceId)
         }
         var options = {
+          pkce: true,
           scope : 'alexa:all',
           scope_data:{
             'alexa:all':{
@@ -146,49 +139,45 @@
               "productInstanceAttributes": { "deviceSerialNumber" : deviceId }
             }
           },
-          popup: false
+          popup: true
         };
-        var returnUrl = location.href.split('#')[0]
-        amazon.Login.authorize(options, returnUrl);
+        let b = document.getElementById('startbutton')
+        b.addEventListener('click', (ev)=>{
+          b.style.display = 'none'
+
+          let tokenKey = 'alexa_atoken'
+          let accessToken = localStorage.getItem(tokenKey)
+          if(accessToken){
+            startAvsaurus(accessToken)
+          }else{
+            amazon.Login.authorize(options, function(response) {
+              if ( response.error ) {
+                localStorage.removeItem(tokenKey)
+                console.log('oauth error ' + response.error);
+                b.style.display = 'inline'
+                return;
+              }
+              amazon.Login.retrieveToken(response.code, function(response) {
+                if ( response.error ) {
+                  localStorage.removeItem(tokenKey)
+                  console.log('oauth error ' + response.error);
+                  b.style.display = 'inline'
+                  return;
+                }
+                localStorage.setItem(tokenKey, response.access_token)
+                startAvsaurus(response.access_token)
+              });
+            });
+          }
+        })
       };
-      window.loadAmazonLogin = function() {
-        var d = window.document;
-
-        /*
-        var a = d.createElement('script'); a.type = 'text/javascript';
-        a.async = true; a.id = 'amazon-login-sdk';
-        a.src = 'https://api-cdn.amazon.com/sdk/login1.js';
-        d.getElementById('amazon-root').appendChild(a);
-        */
-
+      (function(d) {
         var a = d.createElement('script'); a.type = 'text/javascript';
         a.async = true; a.id = 'amazon-login-sdk';
         a.src = 'https://assets.loginwithamazon.com/sdk/na/login1.js';
         d.getElementById('amazon-root').appendChild(a);
-      }
-      var urlParams;
-      (window.onpopstate = function () {
-        var match,
-            pl     = /\+/g,  // Regex for replacing addition symbol with a space
-            search = /([^&=]+)=?([^&]*)/g,
-            decode = function (s) { return decodeURIComponent(s.replace(pl, " ")); },
-            query  = window.location.hash.substring(1);
-        urlParams = {};
-        while (match = search.exec(query)){urlParams[decode(match[1])] = decode(match[2]);}
-
-        if(urlParams.access_token){
-          let b = document.getElementById('startbutton')
-          b.addEventListener('click', (ev)=>{
-            ev.target.parentNode.removeChild(ev.target)
-            startAvsaurus(urlParams.access_token)
-          })
-        }else{
-          loadAmazonLogin()
-        }
-      })();
-
+      })(document);
     </script>
-
     
   </body>
 </html>
