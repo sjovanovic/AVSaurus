@@ -386,6 +386,7 @@ function AVSaurus(options) {
             reader.addEventListener('loadend', (e) => {
               var text = e.srcElement.result;
               console.log('Reply text:', text);
+              inst.trigger('replyobject', [JSON.parse(text)])
             });
             // Start reading the blob as text.
             reader.readAsText(sections[i].file);

@@ -23,6 +23,7 @@
       font-weight: 700;
       font-family: sans-serif;
     }
+    #startbutton{border-radius:7px;padding:24px;font-size:18px;background:transparent;box-shadow: 0px 0px 8px #5555AA; color:#555}
     </style>
     <script src="js/multipart.js"></script>
     <script src="js/audioRecorder.js"></script>
@@ -30,6 +31,7 @@
     <script src="js/avsaurus.js"></script>
   </head>
   <body>
+    <button id="startbutton">Start</button>
     <script>
 
     // AVSaurus
@@ -39,10 +41,10 @@
       }
       var avs = window.avs = new AVSaurus({
         'wakewords':[{
-          id:'COMPUTER',
-          pronounce: 'K AH M P Y UW T ER' // from http://www.speech.cs.cmu.edu/cgi-bin/cmudict
+          id:'LEXIE',
+          pronounce: 'L EH K S IY' // from http://www.speech.cs.cmu.edu/cgi-bin/cmudict
         }],
-        'wakewordSensitivity':"1e-60"
+        'wakewordSensitivity':"1e-20"
       })
       avs.setAccessToken(token)
 
@@ -55,7 +57,7 @@
           document.body.appendChild(dv)
         }
         this.sound(87.31, 'sine')
-        this.statusDiv.innerHTML = 'I\'m listening... (say: <i>computer, what\'s up?</i>)'
+        this.statusDiv.innerHTML = 'I\'m listening... (say: <i>Lexie, tell me a joke.</i>)'
       })
 
       avs.on('wakeword', function(){
@@ -64,7 +66,7 @@
       })
 
       avs.on('sending', function(){
-        this.statusDiv.innerHTML = 'Asking Alexa...'
+        this.statusDiv.innerHTML = 'Asking Lexie...'
       })
 
       avs.on('talking', function(){
@@ -73,6 +75,22 @@
 
       avs.on('token_expired', function(){
         loadAmazonLogin()
+      })
+
+      avs.on('replyobject', function(obj){
+        if(obj && obj.messageBody && obj.messageBody.directives){
+          let ds = obj.messageBody.directives
+          for(let i=0;i<ds.length; i++){
+            if(ds[i].name == "RenderTemplate"){
+              this.statusDiv.innerHTML = `
+              <div style="font-size: 1.4rem;padding:0px 30px 0px 30px;">
+              <h1><img style="width:40px;" src="${ds[i].payload.skillIcon.sources[0].url}"/>&nbsp;${ds[i].payload.title.mainTitle}</h1>
+              <p>${ds[i].payload.textField.replace(/\n/g, '<br/>')}</p>
+              </div>
+              `
+            }
+          }
+        }
       })
 
       /**
@@ -104,8 +122,13 @@
       // clientID and productID of your Alexsa AVS app.
       // note that the domain where this file is hosted needs to be in your app's "Allowed origins"
       // and the url must be in "Allowed return URLs" in your app's Security Profile
-      var clientID = 'YOUR CLIENT ID GOES HERE'
-      var productID = 'YOUR PRODUCT ID GOES HERE'
+      
+      //var clientID = 'YOUR CLIENT ID GOES HERE'
+      //var productID = 'YOUR PRODUCT ID GOES HERE'
+
+      var clientID = 'amzn1.application-oa2-client.49e731244394490ab92c260cfd8131e2'
+      var productID = 'AVSaurus'
+
 
       window.onAmazonLoginReady = function() {
         amazon.Login.setClientId(clientID);
@@ -146,12 +169,18 @@
         while (match = search.exec(query)){urlParams[decode(match[1])] = decode(match[2]);}
 
         if(urlParams.access_token){
-          startAvsaurus(urlParams.access_token)
+          let b = document.getElementById('startbutton')
+          b.addEventListener('click', (ev)=>{
+            ev.target.parentNode.removeChild(ev.target)
+            startAvsaurus(urlParams.access_token)
+          })
         }else{
           loadAmazonLogin()
         }
       })();
 
     </script>
+
+    
   </body>
 </html>
