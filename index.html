@@ -74,7 +74,10 @@
       })
 
       avs.on('token_expired', function(){
-        loadAmazonLogin()
+        //loadAmazonLogin()
+        localStorage.removeItem('alexa_atoken')
+        this.statusDiv.innerHTML = ''
+        document.getElementById('startbutton').style.display = 'inline'
       })
 
       avs.on('replyobject', function(obj){
