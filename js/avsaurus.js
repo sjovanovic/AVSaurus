@@ -240,6 +240,11 @@ function AVSaurus(options) {
 
   this.keywordDetected = function(keyword){
     var inst = this
+    if(keyword){
+      this.lastKeyword = keyword
+    }else{
+      keyword = this.lastKeyword
+    }
     this.startWav()
     this.wavStarted = true;
     this.silenceCount = 0
@@ -308,8 +313,34 @@ function AVSaurus(options) {
     this.accessToken = token
   }
 
-  this.alexaRecognize = function(){
+  this.getStreams = (obj)=>{
+    // get a list of streams
+    if(!obj || !obj.messageBody || !obj.messageBody.directives || !Array.isArray(obj.messageBody.directives)) return []
+    let streams = []
+    for(let i=0;i<obj.messageBody.directives.length; i++){
+      let d = obj.messageBody.directives[i]
+      if(d.namespace == 'AudioPlayer' && d.name == 'play' && d.payload && d.payload.audioItem && d.payload.audioItem.streams && Array.isArray(d.payload.audioItem.streams)){
+        for(let  j=0; j<d.payload.audioItem.streams.length; j++){
+          let s = d.payload.audioItem.streams[j]
+          if(s.streamUrl) streams.push(s.streamUrl)
+        }
+      }
+    }
+    return streams
+  }
 
+  this.shouldListen = function(obj){
+    if(!obj || !obj.messageBody || !obj.messageBody.directives || !Array.isArray(obj.messageBody.directives)) return false
+    for(let i=0;i<obj.messageBody.directives.length; i++){
+      let d = obj.messageBody.directives[i]
+      if(d.namespace == 'SpeechRecognizer' && d.name == 'listen'){
+        return d.payload
+      }
+    }
+    return false
+  }
+
+  this.alexaRecognize = function(){
     var token = this.accessToken;
 
     var formData = new FormData();
@@ -328,7 +359,8 @@ function AVSaurus(options) {
             }]
         },
         "messageBody":{
-            "profile":"alexa-close-talk",
+            //"profile":"alexa-close-talk",
+            "profile":"alexa-far-field-local",
             "locale":"en-us",
             "format":"audio/L16; rate=16000; channels=1"
         }
@@ -370,32 +402,107 @@ function AVSaurus(options) {
 
       inst.trigger('talking')
 
+      let shouldListen = false
       var sounds = []
       var arrayBuffer = request.response;
       if (arrayBuffer) {
         var byteArray = new Uint8Array(arrayBuffer);
         var sections = Multipart.parse(byteArray, boundary);
-        //console.log(sections);
+        console.log(sections);
 
         for (var i = 0; i !== sections.length; ++i) {
           if (sections[i].header['content-type'] === 'audio/mpeg') {
             sounds.push(new Audio(window.URL.createObjectURL(sections[i].file)))
           }else{
-            var reader = new FileReader();
-            // This fires after the blob has been read/loaded.
-            reader.addEventListener('loadend', (e) => {
-              var text = e.srcElement.result;
+
+
+            let text = sections[i].text
+            console.log('Reply text', text)
+            try{
+                let jobj = JSON.parse(text)
+
+                // get streams if any
+                let streams = inst.getStreams(jobj)
+                if(streams.length){
+                  for(let j=0;j<streams.length;j++){
+                    let a = new Audio(streams[j])
+                    a.crossorigin = 'anonymous';
+                    sounds.push(a)
+                  }
+                }
+
+                // should keep listening
+                shouldListen = inst.shouldListen(jobj)
+
+                inst.trigger('replyobject', [jobj])
+              }catch(err){
+                console.log('Failed to parse JSON')
+              }
+
+            /*
+            sections[i].file.text().then(text=>{
               console.log('Reply text:', text);
               try{
                 let jobj = JSON.parse(text)
-                inst.trigger('replyobject', [JSON.parse(text)])
-              }catch(err){}
+
+                // get streams if any
+                let streams = inst.getStreams(jobj)
+                console.log(streams)
+                if(streams.length){
+                  for(let j=0;j<streams.length;j++){
+                    let a = new Audio(streams[j])
+                    a.crossOrigin = 'anonymous';
+                    sounds.push(a)
+                  }
+                }
+
+                inst.trigger('replyobject', [jobj])
+              }catch(err){
+                console.log('Failed to parse JSON')
+              }
+            })
+            */
+
+            /*
+            var reader = new FileReader();
+
+            // This fires after the blob has been read/loaded.
+            reader.addEventListener('loadend', (e) => {
+                //var text = e.srcElement.result;
+                jsonParts.push(e.target.result)
+
+                let text = jsonParts.join('')
+                console.log('Reply text:', text);
+                try{
+                  let jobj = JSON.parse(text)
+
+                  // get streams if any
+                  let streams = inst.getStreams(jobj)
+                  console.log(streams)
+                  if(streams.length){
+                    for(let j=0;j<streams.length;j++){
+                      let a = new Audio(streams[j])
+                      a.crossOrigin = 'anonymous';
+                      sounds.push(a)
+                    }
+                  }
+
+                  inst.trigger('replyobject', [jobj])
+                }catch(err){
+                  console.log('Failed to parse JSON')
+                }
+
             });
             // Start reading the blob as text.
             reader.readAsText(sections[i].file);
+
+            */
+
           }
         }
       }
+
+      
 
       inst.playSounds(sounds, function(err){
         if(err){
@@ -403,10 +510,13 @@ function AVSaurus(options) {
           inst.confirmPlaySounds(sounds, function(err){
             if(err){
               sounds = []
-              inst.startRecording()
+              shouldListen ? inst.keywordDetected() : inst.startRecording()
               inst.trigger('replied')
             }
           })
+        }else{
+          shouldListen ? inst.keywordDetected() : inst.startRecording()
+          inst.trigger('replied')
         }
       })
     }
@@ -422,8 +532,6 @@ function AVSaurus(options) {
         i++;
         if (i == sounds.length) {
           sounds = []
-          inst.startRecording()
-          inst.trigger('replied')
           cb.call(inst)
           return;
         };

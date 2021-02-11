@@ -84,7 +84,7 @@ var Multipart = {
     function processSections(arraybuf, sections) {
       for (var i = 0; i !== sections.length; ++i) {
         var section = sections[i];
-        if (section.header['content-type'] === 'text/plain') {
+        if (section.header['content-type'] === 'text/plain' || section.header['content-type'] === 'application/json') {
           section.text = buf2String(arraybuf.slice(section.bodyStart, section.end));
         } else {
           var imgData = arraybuf.slice(section.bodyStart, section.end);
@@ -136,7 +136,12 @@ var Multipart = {
         'headerStart': arraybuf.byteLength - boundary.length - 2 // 2 hyphens at end
       });
       for (var i = 0; i !== sections.length - 1; ++i) {
-        sections[i].end = sections[i+1].headerStart - boundary.length;
+        if(i+1 === sections.length-1){
+          sections[i].end = sections[i+1].headerStart
+        }else{
+          sections[i].end = sections[i+1].headerStart - boundary.length;
+        }
+        
 
         if (String.fromCharCode(arraybuf[sections[i].end]) === '\r' || '\n') {
           sections[i].end -= 1;

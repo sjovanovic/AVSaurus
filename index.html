@@ -48,35 +48,39 @@
       })
       avs.setAccessToken(token)
 
-      // DOM stuff
-      avs.on('ready', function(){
+      let getStatusDiv = ()=>{
         if(!this.statusDiv){
           var dv = document.createElement('div')
           dv.id = 'status_div'
           this.statusDiv = dv
           document.body.appendChild(dv)
         }
+        return this.statusDiv
+      }
+
+      // DOM stuff
+      avs.on('ready', function(){
+        
         this.sound(87.31, 'sine')
-        this.statusDiv.innerHTML = 'I\'m listening... (say: <i>Lexie, tell me a joke.</i>)'
+        getStatusDiv().innerHTML = 'I\'m listening... (say: <i>Lexie, tell me a joke.</i>)'
       })
 
       avs.on('wakeword', function(){
         this.sound(440.0, 'sine')
-        this.statusDiv.innerHTML = 'You called?'
+        getStatusDiv().innerHTML = 'Listening?'
       })
 
       avs.on('sending', function(){
-        this.statusDiv.innerHTML = 'Asking Lexie...'
+        getStatusDiv().innerHTML = 'Asking Lexie...'
       })
 
       avs.on('talking', function(){
-        this.statusDiv.innerHTML = 'talking...'
+        getStatusDiv().innerHTML = 'talking...'
       })
 
       avs.on('token_expired', function(){
-        //loadAmazonLogin()
-        localStorage.removeItem('alexa_atoken')
-        this.statusDiv.innerHTML = ''
+        removeToken()
+        getStatusDiv().innerHTML = ''
         document.getElementById('startbutton').style.display = 'inline'
       })
 
@@ -85,7 +89,7 @@
           let ds = obj.messageBody.directives
           for(let i=0;i<ds.length; i++){
             if(ds[i].name == "RenderTemplate"){
-              this.statusDiv.innerHTML = `
+              getStatusDiv().innerHTML = `
               <div style="font-size: 1.4rem;padding:0px 30px 0px 30px;">
               <h1><img style="width:40px;" src="${ds[i].payload.skillIcon.sources[0].url}"/>&nbsp;${ds[i].payload.title.mainTitle}</h1>
               <p>${ds[i].payload.textField.replace(/\n/g, '<br/>')}</p>
@@ -119,7 +123,105 @@
     </script>
 
 
-    
+    <div id="amazon-root"></div>
+    <script type="text/javascript">
+
+      var clientID = 'amzn1.application-oa2-client.49e731244394490ab92c260cfd8131e2'
+      var productID = 'AVSaurus'
+
+      var deviceKey = 'alexa_deviceId'
+      var deviceId = localStorage.getItem(deviceKey)
+      var tokenKey = 'atoken_akey'
+      if(!deviceId){
+        deviceId = (Math.random() +'').substring(2)
+        localStorage.setItem(deviceKey, deviceId)
+      }
+      var options = {
+          interactive:'auto',
+          pkce: true,
+          scope : 'alexa:all',
+          scope_data:{
+            'alexa:all':{
+              "productID" : productID,
+              "productInstanceAttributes": { "deviceSerialNumber" : deviceId }
+            }
+          },
+          popup: true
+      };
+
+      let removeToken = ()=>{
+        localStorage.removeItem(tokenKey)
+      }
+
+      let getToken = ()=>{
+        let resp = localStorage.getItem(tokenKey)
+        let valid = false
+        if(resp){
+          try{
+            resp = JSON.parse(resp)
+            if(resp && resp.access_token && resp.expires_in && resp.time){
+              let expires = new Date(resp.time + (resp.expires_in * 1000))
+              let now = new Date()
+              if(now < expires){
+                valid = true
+              }
+            }
+          }catch(err){}
+        }
+        if(valid) {
+          return resp.access_token
+        }else{
+          removeToken()
+          return null
+        }
+      }
+
+      let getAccessToken = (cb)=>{
+        if(!cb) cb = function(){}
+        let token = getToken()
+        if(token) return cb(token)
+        amazon.Login.authorize(options, function(response) {
+          if (response.error) {
+            console.log('oauth authorize error ' + response.error);
+            removeToken()
+            return;
+          }
+          amazon.Login.retrieveToken(response.code, function(response) {
+            if ( response.error ) {
+              console.log('oauth retrieveToken error ' + response.error);
+              removeToken()
+              return;
+            }
+            response.time = new Date().getTime()
+            localStorage.setItem(tokenKey, JSON.stringify(response))
+            cb(response.access_token)
+          });
+        })
+      }
+
+      // start avsaurus on sucessful login
+      window.onAmazonLoginReady = ()=>{
+        amazon.Login.setClientId(clientID);
+
+
+        let b = document.getElementById('startbutton')
+        b.addEventListener('click', (ev)=>{
+          b.style.display = 'none'
+          getAccessToken((token)=>startAvsaurus(token))
+        })
+        
+      }
+
+      // load amazon lib.
+      (function(d) {
+        var a = d.createElement('script'); a.type = 'text/javascript';
+        a.async = true; a.id = 'amazon-login-sdk';
+        a.src = 'https://assets.loginwithamazon.com/sdk/na/login1.js';
+        d.getElementById('amazon-root').appendChild(a);
+      })(document);
+    </script>
+
+    <!--
     <div id="amazon-root"></div>
     <script type="text/javascript">
 
@@ -144,6 +246,7 @@
           },
           popup: true
         };
+
         let b = document.getElementById('startbutton')
         b.addEventListener('click', (ev)=>{
           b.style.display = 'none'
@@ -181,6 +284,7 @@
         d.getElementById('amazon-root').appendChild(a);
       })(document);
     </script>
+    -->
     
   </body>
 </html>
