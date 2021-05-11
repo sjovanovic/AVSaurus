@@ -6,6 +6,7 @@
     body {
       height: 100%;
       overflow: hidden;
+      background-color: #0b2139;
     }
     body { /* can also be whatever container */
       display: flex;
@@ -21,270 +22,374 @@
       padding: 0px;
       font-size: 3.2rem;
       font-weight: 700;
+      color:white;
+      text-shadow: 0px 0px 8px #8e8e8e;
+    }
+    #startbutton{
+      background: rgb(51,108,131);
+      background: linear-gradient(308deg, rgba(51,108,131,1) 0%, rgba(113,233,212,1) 100%);
+      height:100px;width:100px;border-radius:50px;font-size:24px;box-shadow: 0px 0px 8px #9e9e9e;
+      border-color: #1a3c4c;
+      border-width:10px;
+      color:#1a3c4c;
+      font-weight:bold;
+    }
+    #startbutton:focus {outline:0;}
+    
+    
+
+    /* Switch */
+    #debug_switch{
+      position: fixed;
+      right: 26px;
+      top: 0px;
+    }
+    .switch {
+      margin: 30% auto; 
+      width: 80px;
+    }
+    .toggle {
+      position: absolute;
+      margin-left: -9999px;
+      visibility: hidden;
+    }
+    .toggle + label {
+      display: block;
+      position: relative;
+      cursor: pointer;
+      outline: none;
+      user-select: none;
+      padding: 2px;
+      width: 80px;
+      height: 40px;
+      background-color: #dddddd;
+      border-radius: 40px;
+    }
+
+    .toggle + label:before,
+    .toggle + label:after {
+      display: block;
+      position: absolute;
+      top: 1px;
+      left: 1px;
+      bottom: 1px;
+      content: "";
+    }
+    .toggle + label:before {
+      right: 1px;
+      background-color: #f1f1f1;
+      border-radius: 40px;
+      transition: background 0.4s;
+    }
+    .toggle + label:after {
+      width: 40px;
+      background-color: #fff;
+      border-radius: 100%;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+      transition: margin 0.4s;
+    }
+    .toggle:checked + label:before {
+      background-color: #8ce196;
+    }
+    .toggle:checked + label:after {
+      margin-left: 42px;
+    }
+
+
+    /* Sliders */
+    #debug_area {
+      position: fixed;
+      right: 26px;
+      top: 0px;
+      color:white;
+      text-align: right;
       font-family: sans-serif;
     }
-    #startbutton{border-radius:7px;padding:24px;font-size:18px;background:transparent;box-shadow: 0px 0px 8px #5555AA; color:#555}
+    
     </style>
+    
+
+    <!-- Porcupine -->
+    <script src="ppine/web_voice_processor.js"></script>
+    <script src="ppine/porcupine_manager.js"></script>
+    <script src="ppine/lexieporcupine.js"></script>
+
+    <!-- AVSaurus -->
     <script src="js/multipart.js"></script>
-    <script src="js/audioRecorder.js"></script>
-    <script src="js/callbackManager.js"></script>
+    <script src="js/amazonlogin.js"></script>
     <script src="js/avsaurus.js"></script>
+
+
   </head>
   <body>
-    <button id="startbutton">Start</button>
+
+    <div id="debug_area">
+      <div><span id="current_power"></span></div>
+    </div>
+
+    <button id="startbutton">lexie</button>
     <script>
 
-    // AVSaurus
-    function startAvsaurus(token){
-      if(window.avs){
-        return window.avs.setAccessToken(token)
-      }
-      var avs = window.avs = new AVSaurus({
-        'wakewords':[{
-          id:'LEXIE',
-          pronounce: 'L EH K S IY' // from http://www.speech.cs.cmu.edu/cgi-bin/cmudict
-        }],
-        'wakewordSensitivity':"1e-20"
-      })
-      avs.setAccessToken(token)
 
-      let getStatusDiv = ()=>{
-        if(!this.statusDiv){
-          var dv = document.createElement('div')
-          dv.id = 'status_div'
-          this.statusDiv = dv
-          document.body.appendChild(dv)
-        }
-        return this.statusDiv
-      }
+      var avs = null
+      function startAvsaurus(token){
 
-      // DOM stuff
-      avs.on('ready', function(){
-        
-        this.sound(87.31, 'sine')
-        getStatusDiv().innerHTML = 'I\'m listening... (say: <i>Lexie, tell me a joke.</i>)'
-      })
+        // integration code
+        avs = new AVSaurus();
+        avs.setAccessToken(token)
 
-      avs.on('wakeword', function(){
-        this.sound(440.0, 'sine')
-        getStatusDiv().innerHTML = 'Listening?'
-      })
 
-      avs.on('sending', function(){
-        getStatusDiv().innerHTML = 'Asking Lexie...'
-      })
 
-      avs.on('talking', function(){
-        getStatusDiv().innerHTML = 'talking...'
-      })
 
-      avs.on('token_expired', function(){
-        removeToken()
-        getStatusDiv().innerHTML = ''
-        document.getElementById('startbutton').style.display = 'inline'
-      })
+        /**
+         * 
+         * 
+         * 
+         *  debug & application specific code below (do not use for integration)
+         * 
+         * 
+         * 
+         **/
 
-      avs.on('replyobject', function(obj){
-        if(obj && obj.messageBody && obj.messageBody.directives){
-          let ds = obj.messageBody.directives
-          for(let i=0;i<ds.length; i++){
-            if(ds[i].name == "RenderTemplate"){
-              getStatusDiv().innerHTML = `
-              <div style="font-size: 1.4rem;padding:0px 30px 0px 30px;">
-              <h1><img style="width:40px;" src="${ds[i].payload.skillIcon.sources[0].url}"/>&nbsp;${ds[i].payload.title.mainTitle}</h1>
-              <p>${ds[i].payload.textField.replace(/\n/g, '<br/>')}</p>
-              </div>
-              `
+
+        let getStatusDiv = ()=>{
+            if(!avs.statusDiv){
+              let dv = document.getElementById('status_div')
+              if(!dv) {
+                dv = document.createElement('div')
+                dv.id = 'status_div'
+                document.body.appendChild(dv)
+              }
+              avs.statusDiv = dv
             }
+            return avs.statusDiv
+        }
+
+        // display code
+        avs.on('ready.avs', ()=>{
+          getStatusDiv().innerHTML = 'Lexie is ready'
+        })
+        avs.on('sending.avs', function(){
+          getStatusDiv().innerHTML = 'Asking Lexie...'
+        })
+        avs.on('talking.avs', function(){
+          getStatusDiv().innerHTML = 'talking.'
+        })
+        avs.on('listening.avs', function(){
+          getStatusDiv().innerHTML = `I'm listening.`
+        })
+        avs.on('token_expired.avs', function(){
+          alogin.removeToken()
+          getStatusDiv().innerHTML = ''
+          document.getElementById('startbutton').style.display = 'inline'
+        })
+
+        // power levels
+        let pwr = document.querySelector('#current_power')
+        avs.on('power', (p)=>pwr.innerHTML=p+' RMS')
+
+        // sliders for tweaking
+
+        /*
+        let makeSlider = (opts)=>{
+          let deft ={
+            id: 'slider',
+            class:'sliders',
+            parent:null,
+            label:'',
+            min:0,
+            max: 1000,
+            step: 1,
+            val: 0,
+            cb: function(){}
+          }
+          if(!opts) opts = {}
+          for(let i in deft){ if(opts[i] == undefined) opts[i] = deft[i] }
+          let dbgs = document.querySelector('#' + opts.id)
+          if(!dbgs) {
+            dbgs = document.createElement('div')
+            dbgs.id = opts.id
+            dbgs.className = opts.class
+            dbgs.innerHTML = `<label for="${opts.id}_slider">${opts.label}&nbsp;<span id="${opts.id}_value"></span></label>
+            <input type="range" min="${opts.min}" max="${opts.max}" value="${opts.val}" class="slider" id="${opts.id}_slider">`
+            if(opts.parent) {
+              opts.parent.appendChild(dbgs)
+            }else{
+              document.body.appendChild(dbgs)
+            }
+            document.querySelector(`#${opts.id}_value`).innerHTML = opts.val
+            document.querySelector(`#${opts.id}_slider`).addEventListener('input', (ev)=>{
+              document.querySelector(`#${opts.id}_value`).innerHTML = ev.target.value
+              opts.cb(ev.target.value)
+            })
           }
         }
-      })
 
-      /**
-       * Some browsers (like Safari) won't allow sounds to play
-       * if it isn't triggered by an onclick event
-       * @param  {Function} onclickFunction function to call during onclick event
-       * @return {undefined}
-       */
-      avs.on('click_confirm', function(onclickFunction){
-        var dv = document.createElement('button')
-        dv.id = 'confirm_play_btn'
-        dv.style.left = '10px'
-        dv.innerHTML = 'Play the response'
-        dv.onclick = function(){
-          dv.parentNode.removeChild(dv)
-          onclickFunction()
+        makeSlider({
+          id:'silenceSamples',
+          label:'Accuracy:',
+          parent:document.querySelector('#debug_area'),
+          val:30,
+          min:1,
+          max:100,
+          cb:(val)=>avs.silenceSamples=val/1
+        })
+        makeSlider({
+          id:'silenceThreshold',
+          label:'Silence threshold:',
+          parent:document.querySelector('#debug_area'),
+          val:500,
+          min:1,
+          max:10000,
+          cb:(val)=>avs.silenceThreshold=val/1
+        })
+        makeSlider({
+          id:'silenceMaxLength',
+          label:'Silence max duration:',
+          parent:document.querySelector('#debug_area'),
+          val:40,
+          min:1,
+          max:100,
+          cb:(val)=>avs.silenceMaxLength=val/1
+        })
+        */
+
+        
+        /*
+        // debug recordings
+        let debugSwitch = ()=>{
+          let dbgs = document.querySelector('#debug_switch')
+          if(!dbgs) {
+            dbgs = document.createElement('div')
+            dbgs.id = 'debug_switch'
+            dbgs.innerHTML = `<div title="Debug mode on or off" class="switch">
+              <input id="toggle-btn" class="toggle" type="checkbox">
+              <label for="toggle-btn"></label>
+            </div>`
+            document.body.appendChild(dbgs)
+            document.querySelector('#toggle-btn').addEventListener('click', (ev)=>{
+              if(ev.target.checked){
+                avs.options.saveRequest = true
+              }else{
+                avs.options.saveRequest = false
+              }
+            })
+          }
         }
-        document.body.appendChild(dv)
-      })
+        debugSwitch()
+      */
 
-    }
+
+      }
+
+
+      
+    
 
     </script>
 
 
     <div id="amazon-root"></div>
     <script type="text/javascript">
-
       var clientID = 'amzn1.application-oa2-client.49e731244394490ab92c260cfd8131e2'
       var productID = 'AVSaurus'
 
-      var deviceKey = 'alexa_deviceId'
-      var deviceId = localStorage.getItem(deviceKey)
-      var tokenKey = 'atoken_akey'
-      if(!deviceId){
-        deviceId = (Math.random() +'').substring(2)
-        localStorage.setItem(deviceKey, deviceId)
-      }
-      var options = {
-          interactive:'auto',
-          pkce: true,
-          scope : 'alexa:all',
-          scope_data:{
-            'alexa:all':{
-              "productID" : productID,
-              "productInstanceAttributes": { "deviceSerialNumber" : deviceId }
-            }
-          },
-          popup: true
-      };
 
-      let removeToken = ()=>{
-        localStorage.removeItem(tokenKey)
-      }
 
-      let getToken = ()=>{
-        let resp = localStorage.getItem(tokenKey)
-        let valid = false
-        if(resp){
-          try{
-            resp = JSON.parse(resp)
-            if(resp && resp.access_token && resp.expires_in && resp.time){
-              let expires = new Date(resp.time + (resp.expires_in * 1000))
-              let now = new Date()
-              if(now < expires){
-                valid = true
-              }
-            }
-          }catch(err){}
-        }
-        if(valid) {
-          return resp.access_token
-        }else{
-          removeToken()
-          return null
-        }
-      }
 
-      let getAccessToken = (cb)=>{
-        if(!cb) cb = function(){}
-        let token = getToken()
-        if(token) return cb(token)
-        amazon.Login.authorize(options, function(response) {
-          if (response.error) {
-            console.log('oauth authorize error ' + response.error);
-            removeToken()
-            return;
-          }
-          amazon.Login.retrieveToken(response.code, function(response) {
+      /*
+      window.doLogin = function() {
+
+        console.log('doLogin ovde')
+
+        var tokenResponse = amazon.Login.retrieveToken();
+        if (tokenResponse) {
+          console.log('tokenResponse ovde')
+          startAvsaurus(tokenResponse.access_token)
+        } else {
+          var options = {
+              interactive: 'auto',
+              pkce: true,
+              scope: 'alexa:all',
+              scope_data: {
+                  'alexa:all': {
+                      "productID": productID,
+                      "productInstanceAttributes": {
+                          "deviceSerialNumber": '2342342343'
+                      }
+                  }
+              },
+              popup: true
+          };
+          console.log('authorize ovde')
+          amazon.Login.authorize(options, function(response) {
             if ( response.error ) {
-              console.log('oauth retrieveToken error ' + response.error);
-              removeToken()
+              alert('oauth error ' + response.error);
               return;
             }
-            response.time = new Date().getTime()
-            localStorage.setItem(tokenKey, JSON.stringify(response))
-            cb(response.access_token)
+            console.log('authorize response ovde', response)
+            amazon.Login.retrieveToken(response.code, function(response) {
+                console.log('retrieveToken ovde', response)
+                startAvsaurus(response.access_token)
+            });
           });
-        })
+        };
+      };
+
+      window.onAmazonLoginReady = () => {
+
+          console.log('onAmazonLoginReady ovde')
+          amazon.Login.setClientId(clientID);
+          amazon.Login.setUseCookie(true);
+          amazon.Login.setSiteDomain(location.host)
+
+          let b = document.getElementById('startbutton')
+          b.addEventListener('click', (ev)=>{
+            b.style.display = 'none'
+
+            console.log('click lexie ovde')
+
+            doLogin()
+          })
       }
 
-      // start avsaurus on sucessful login
-      window.onAmazonLoginReady = ()=>{
-        amazon.Login.setClientId(clientID);
-
-
-        let b = document.getElementById('startbutton')
-        b.addEventListener('click', (ev)=>{
-          b.style.display = 'none'
-          getAccessToken((token)=>startAvsaurus(token))
-        })
-        
-      }
 
       // load amazon lib.
-      (function(d) {
-        var a = d.createElement('script'); a.type = 'text/javascript';
-        a.async = true; a.id = 'amazon-login-sdk';
-        a.src = 'https://assets.loginwithamazon.com/sdk/na/login1.js';
-        d.getElementById('amazon-root').appendChild(a);
+      (function (d) {
+          var a = d.createElement('script');
+          a.type = 'text/javascript';
+          a.async = true;
+          a.id = 'amazon-login-sdk';
+          a.src = 'https://assets.loginwithamazon.com/sdk/na/login1.js';
+          d.getElementById('amazon-root').appendChild(a);
       })(document);
-    </script>
 
-    <!--
-    <div id="amazon-root"></div>
-    <script type="text/javascript">
 
-      var clientID = 'amzn1.application-oa2-client.49e731244394490ab92c260cfd8131e2'
-      var productID = 'AVSaurus'
 
-      window.onAmazonLoginReady = function() {
-        amazon.Login.setClientId(clientID);
-        var deviceId = localStorage.getItem('alexa_deviceId')
-        if(!deviceId){
-          deviceId = (Math.random() +'').substring(2)
-          localStorage.setItem('alexa_deviceId', deviceId)
+      */
+
+
+
+
+      var alogin = new AmazonLogin({
+        clientID:clientID,
+        productID:productID,
+        ready:()=>{
+          let b = document.getElementById('startbutton')
+          b.addEventListener('click', (ev)=>{
+            b.style.display = 'none'
+            alogin.getAccessToken((token)=>startAvsaurus(token))
+
+            //let token = 'Atza|IwEBIFI9UjJ77AN6DfS3UlJ7Bsae1ErB0B1X2JwoG2qyqlgok0AIGJmmoLGIi2QqshPzlWbFyd-EV0gnX9UckweARrE5pMX9o3bC3bwQui2uP9NoZsN4JyPbpnC8gfm_3iEqak1bqYm4JO_FVjWlIGn8lAFTg8eASY7GTrgZgjFm8NO7UKsnA-NeWnHp07Pj79vYjJzMqPVxJjIxIToh8-3UgmNS_mO99zskw6TEyCt-lDPdP2YoK70s5FLzcErpT7kNX2rZXrGZ7ijseYMKBFkq9r7NbiEX_TMJ3ClsgUgt68Qcwp9UCbGHcUIEFsnJzfug2m6FR5qXgjWPYo7Y-_du2X4p'
+            //startAvsaurus(token)
+          })
         }
-        var options = {
-          pkce: true,
-          scope : 'alexa:all',
-          scope_data:{
-            'alexa:all':{
-              "productID" : productID,
-              "productInstanceAttributes": { "deviceSerialNumber" : deviceId }
-            }
-          },
-          popup: true
-        };
-
-        let b = document.getElementById('startbutton')
-        b.addEventListener('click', (ev)=>{
-          b.style.display = 'none'
-
-          let tokenKey = 'alexa_atoken'
-          let accessToken = localStorage.getItem(tokenKey)
-          if(accessToken){
-            startAvsaurus(accessToken)
-          }else{
-            amazon.Login.authorize(options, function(response) {
-              if ( response.error ) {
-                localStorage.removeItem(tokenKey)
-                console.log('oauth error ' + response.error);
-                b.style.display = 'inline'
-                return;
-              }
-              amazon.Login.retrieveToken(response.code, function(response) {
-                if ( response.error ) {
-                  localStorage.removeItem(tokenKey)
-                  console.log('oauth error ' + response.error);
-                  b.style.display = 'inline'
-                  return;
-                }
-                localStorage.setItem(tokenKey, response.access_token)
-                startAvsaurus(response.access_token)
-              });
-            });
-          }
-        })
-      };
-      (function(d) {
-        var a = d.createElement('script'); a.type = 'text/javascript';
-        a.async = true; a.id = 'amazon-login-sdk';
-        a.src = 'https://assets.loginwithamazon.com/sdk/na/login1.js';
-        d.getElementById('amazon-root').appendChild(a);
-      })(document);
+      })
+      
+      
     </script>
-    -->
+
+    
     
   </body>
 </html>

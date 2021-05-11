@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Lexie Porcupine Demo</title>
+  </head>
+  <body>
+    
+    <h1>Lexie Porcupine demo</h1>
+
+    <button id="startstop">Start</button>
+
+    <script src="web_voice_processor.js"></script>
+    <script src="porcupine_manager.js"></script>
+    <script src="lexieporcupine.js"></script>
+    <script>
+
+        
+        let lp = new LexiePorcupine({
+            detected:()=>{
+                alert('Lexie detected')
+            }
+        })
+
+
+        let running = false
+        document.querySelector('#startstop').addEventListener('click', (e)=>{
+            if(running) {
+                e.target.innerText = 'Start'
+                lp.stop()
+            }else{
+                e.target.innerText = 'Stop'
+                lp.start()
+            }
+            running = !running
+        })
+      
+
+    </script>
+  </body>
+</html>

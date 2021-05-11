@@ -1,45 +1,10 @@
-function AVSaurus(options) {
-  var defaults = {
-    'workerDir':'js'
-  }
-  options = options || {}
-  for(var i in defaults){
-    if(options[i] === undefined){
-      options[i] = defaults[i]
-    }
-  }
+function AVSaurus(opts){
+  if(!opts) opts = {}
+  let inst = this
 
-  var inst = this;
-
-  // These will be initialized later
-  var recognizer, recorder, callbackManager, audioContext, detectedKeywords = 0;
-
-  // Only when both recorder and recognizer do we have a ready application
-  var isRecorderReady = isRecognizerReady = isEverythingReady = false;
-
-  // A convenience function to post a message to the recognizer and associate
-  // a callback to its response
-  function postRecognizerJob(message, callback) {
-    var msg = message || {};
-    if (callbackManager) msg.callbackId = callbackManager.add(callback);
-    if (recognizer) recognizer.postMessage(msg);
-  };
-
-  // This function initializes an instance of the recorder
-  // it posts a message right away and calls onReady when it
-  // is ready so that onmessage can be properly set
-  function spawnWorker(workerURL, onReady) {
-    recognizer = new Worker(workerURL);
-    recognizer.onmessage = function(event) {
-      onReady(recognizer);
-    };
-    // As arguments, you can pass non-default path to pocketsphinx.js and pocketsphinx.wasm:
-    recognizer.postMessage({
-      'pocketsphinx.wasm': 'pocketsphinx.wasm',
-      'pocketsphinx.js': 'pocketsphinx.js'
-    });
-    //recognizer.postMessage({});
-  };
+  let options = {}
+  for(let i in opts) options[i] = opts[i]
+  inst.options = options
 
   var setString = function(view, offset, str) {
     var len = str.length;
@@ -47,273 +12,413 @@ function AVSaurus(options) {
       view.setUint8(offset + i, str.charCodeAt(i));
   };
 
-  /**
-   * Another consumer is for recording after the wakeword
-   * @type {Object}
-   */
-  var anotherConsumer = {
-    postMessage: function(data) {
-      if (data && data.command == 'process') {
-        //console.log('Buffer data', data, data.data[0], data.data[1], data.data[2])
-        if(inst.audioProcess){
-          inst.audioProcess(data)
-        }
-      }
-    }
-  }
 
-  // Callback function once the user authorises access to the microphone
-  // in it, we instanciate the recorder
-  function startUserMedia(stream) {
-    var input = audioContext.createMediaStreamSource(stream);
-    // Firefox hack https://support.mozilla.org/en-US/questions/984179
-    window.firefox_audio_hack = input;
-    inst.lastSilence = Date.now()
-    var audioRecorderConfig = {
-      worker: options.workerDir + '/audioRecorderWorker.js',
-      errorCallback: function(er) {
-        if(er == 'silent'){
-          inst.lastSilence = Date.now()
-        }else{
-          console.log("Error from recorder: " + er);
-        }
-      }
-    };
-    recorder = new AudioRecorder(input, audioRecorderConfig);
-    // If a recognizer is ready, we pass it to the recorder
-    if (recognizer) recorder.consumers = [recognizer, anotherConsumer];
-    isRecorderReady = true;
-
-    if(isRecognizerReady && !isEverythingReady){
-      isEverythingReady = true
-      startRecording()
-    }
-
-    console.log("Audio recorder ready");
-  };
-
-  // This starts recording. We first need to get the id of the keyword search to use
-  var startRecording = function(id) {
-    id = id || 1
-    if (recorder && recorder.start(id)) {
-      console.log("Recording started");
-      detectedKeywords = 0
-      inst.trigger('ready')
-    }
-  };
-
-  // Stops recording
-  var stopRecording = function() {
-    recorder && recorder.stop();
-    console.log("Recording stopped");
-    inst.trigger('paused')
-  };
-
-  // Called once the recognizer is ready
-  // We then add the grammars to the input select tag and update the UI
-  var recognizerReady = function() {
-    isRecognizerReady = true;
-    if(isRecorderReady && !isEverythingReady){
-      isEverythingReady = true
-      startRecording()
-    }
-    console.log("Recognizer ready");
-  };
-
-  // This adds a keyword search from the array
-  // We add them one by one and call it again as
-  // a callback.
-  // Once we are done adding all grammars, we can call
-  // recognizerReady()
-  var feedKeyword = function(g, index, id) {
-    if (id && (keywordIds.length > 0)) keywordIds[0].id = id.id;
-    if (index < g.length) {
-      keywordIds.unshift({
-        title: g[index].title
-      })
-      postRecognizerJob({
-          command: 'addKeyword',
-          data: g[index].g
+  var init = function(){
+    console.log('Starting porcupine...');
+    let lp = new LexiePorcupine({
+        path: options.porcupinePath || './ppine/',
+        ready:()=>{
+          inst.trigger('ready')
         },
-        function(id) {
-          feedKeyword(keywords, index + 1, {
-            id: id
-          });
-        });
-    } else {
-      recognizerReady();
-    }
-  };
+        error:function(err){
+          console.error('Porcupine error', err)
+        },
+        detected:(wrd)=>{
+          inst.wakewordDetected(wrd)
+        },
+        frameProcessor:function(frame){
+          if(inst.audioProcess){
+            inst.audioProcess(frame)
+          }
+        },
+        initCallback:function(resp){
 
-  // This adds words to the recognizer. When it calls back, we add grammars
-  var feedWords = function(words) {
-    postRecognizerJob({
-        command: 'addWords',
-        data: words
-      },
-      function() {
-        feedKeyword(keywords, 0);
-      });
-  };
+          let audioCtx = resp.audioContext
+          let source = resp.audioSource
+          var analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 2048;
+          
+          var bufferLength = analyser.frequencyBinCount;
+          var dataArray = new Uint8Array(bufferLength);
+          analyser.getByteTimeDomainData(dataArray);
+          source.connect(analyser);
 
-  // This initializes the recognizer. When it calls back, we add words
-  var initRecognizer = function() {
-    // You can pass parameters to the recognizer, such as : {command: 'initialize', data: [["-hmm", "my_model"], ["-fwdflat", "no"]]}
-    // -kws_threshold - 1e-0 : strict, > 1e-50 : permissive
-    postRecognizerJob({
-        command: 'initialize',
-        data: [
-          ["-kws_threshold", options.wakewordSensitivity || "1e-80"]
-        ]
-      },
-      function() {
-        if (recorder) {
-          recorder.consumers = [recognizer, anotherConsumer];
+          inst.fft = {
+            analyser:analyser,
+            dataArray:dataArray,
+            source:source,
+            audioCtx:audioCtx,
+            bufferLength:bufferLength
+          }
+
         }
-        feedWords(wordList);
-      });
-  };
+    })
+    inst.lp = lp
+    lp.start()
 
+    inst.initAudioPlayer()
 
-  function startWav(sampleRate, numChannels){
-    this.sampleRate = sampleRate || 16000;
-    this.numChannels = numChannels || 1;
-    this.numSamples = 0;
-    this.dataViews = [];
-  }
-  this.startWav = startWav
-  function cleanupWav(){
-    delete this.dataViews;
+    inst.businessLogic()
+
+    
   }
 
+  inst.getFFT = function(){
+    if(inst.fft && inst.fft.analyser){
+      inst.fft.analyser.getByteTimeDomainData(inst.fft.dataArray);
+      return inst.fft.dataArray
+    }
+    return []
+  }
+
+  // events minimal implementation
+  inst.on = function(evtName, fn){
+    if(!inst.events){inst.events = {}}
+    var npts = evtName.split('.'), there = inst.events
+    for(var i=0; i<npts.length; i++){
+      if(!there[npts[i]]){
+        if(i == npts.length - 1){
+          there[npts[i]] = fn
+          break;
+        }else{
+          there[npts[i]] = {}
+        }
+      }
+      there = there[npts[i]]
+    }
+  }
+  inst.trigger = function(evtName, args){
+    inst.lastEvent = evtName
+    if(!inst.events){ return }
+    var npts = evtName.split('.'), there = inst.events, isRun = false
+    for(var i=0; i<npts.length; i++){
+      if(there[npts[i]]){
+        if(i == npts.length - 1 && typeof there[npts[i]] != 'function'){
+          for(var j in there[npts[i]]){
+            if(typeof there[npts[i]][j] == 'function'){
+              isRun = true
+              there[npts[i]][j].apply(inst, args)
+            }
+          }
+          return isRun
+        }
+        if(typeof there[npts[i]] == 'function'){
+          isRun = true
+          there[npts[i]].apply(inst, args)
+        }
+        there = there[npts[i]]
+      }else{
+        break
+      }
+    }
+    return isRun
+  }
+
+  inst.wakewordDetect = true
+  var wakewordDetected = function(wrd){
+    if(inst.wakewordDetect){
+      inst.trigger('wakeword', [wrd])
+    }
+  }
+  inst.wakewordDetected = wakewordDetected
+
+  // silence detection
+  inst.detectSilence = true
+  var silenceDetect = function(data){
+
+    return inst.detectSilenceFFT()
+
+    if(!inst.detectSilence) {
+      inst.silenceCount = 0
+      return
+    }
+    // detect silence by determining RMS power of the frame
+    var ssum = 0, idx = 0, samples = inst.silenceSamples || 30, silenceThreshold = inst.silenceThreshold || 500, silenceMaxLength = inst.silenceMaxLength || 40;
+
+    for(var i=0;i<samples;i++){
+      idx = Math.round(Math.random() * data.length)
+      idx = data.length-1 == idx ? idx-1 : idx; 
+      ssum += Math.pow(data[idx], 2) + Math.pow(data[idx+1], 2)
+    }
+    let power = Math.sqrt(ssum/samples)
+
+    inst.trigger('power', [power])
+    
+    let isSilence = false
+    if(!isNaN(power)){
+      if(power < silenceThreshold){
+        inst.silenceCount += 1
+        isSilence = true
+      }else{
+        inst.silenceCount = 0
+      }
+    }
+
+    // if silence is detected in more than silenceMaxLength buffers
+    if(inst.silenceCount >= silenceMaxLength){
+      inst.silenceCount = 0
+      inst.trigger('silence')
+    }
+    return isSilence
+  }
+
+  inst.detectSilenceFFT = function(){
+    
+    if(!inst.detectSilence) return
+
+    let freqs = inst.getFFT()
+    if(!freqs || !freqs.length) return
+    
+    // voice freqs between 500hz - 4000hz
+
+    // settings
+    let startFreq = 1500 // minimum frequency
+    let endFreq = 3500 // maximum frequency
+    let minPowerThreshold = 5 // minimum power in frequency
+    let minFreqBands = 5 // minimum number of bands covered
+
+    let minPersistencyTime = 500 // minimum time for silence or voice to persist in order to switch
+    let minTimesDetected = 8 // minimum number of times voice is detected during persistency time
+    
+
+    let rangeWidth = Math.round(16000 / inst.fft.bufferLength)
+    let idxStart = Math.round(startFreq / rangeWidth)
+    let idxEnd = Math.round(endFreq / rangeWidth)
+
+
+    if(freqs && freqs.length > idxStart && freqs.length > idxEnd){
+      let peaks = []
+      for(let i=idxStart; i<=idxEnd; i++){
+        if(freqs[i] - 128 > minPowerThreshold){
+          peaks.push(rangeWidth * i)
+        }
+      }
+
+      if(peaks.length > minFreqBands){
+        //console.log('Peaks', peaks)
+        counter('speechCount')
+        return false
+      }else{
+       
+      }
+    }
+    // Trigger silence if it is detected at least 50 times in last 2500ms 
+    timeThreshold('silentCount', 2500, 50, (cnt, silentCount)=>{
+
+      let speechCnt = counter('speechCount', true).count || 0
+
+      console.log('speech / silence', `${speechCnt}/${silentCount}`, speechCnt/silentCount)
+
+      inst.trigger('silence')
+    })
+
+    return true
+  }
+
+
+  let counter = function(name, reset){
+    let i = inst, n = name;
+    if(!i.cc) i.cc = {}
+    if(!i.cc[n]) i.cc[n] = {count:0, start: Date.now()}
+    let c = i.cc[n];
+    let y = c.count
+    if(reset) {
+      let r = {count:y, start:c.start, end: Date.now()}
+      delete i.cc[n]
+      return r
+    }
+    c.count = y + 1
+    return y
+  }
+
+  let timeThreshold = function(name, millis, threshold, cb, opts){
+    let i = inst, n = name, o=opts||{};
+    if(!i.tt) i.tt = {}
+    if(!i.tt[n]) i.tt[n] = {times:[], cnt:{}}
+    let t = i.tt[n];
+    if(o.counter) {
+      if(!t.cnt[o.counter]) t.cnt[o.counter] = 0
+      t.cnt[o.counter] ++;
+      return
+    }
+    let nw = Date.now();
+    t.times.push(nw);
+    let cnt = 0;
+    let stime = nw - millis;
+    for(let i=t.times.length-1;i>=0; i=i-1){
+      if(t.times[i] > stime) {
+        cnt = cnt + 1;
+      }else{
+        break;
+      }
+    }    
+    if(cnt >= threshold && stime >= t.times[0]){
+      cb(cnt, t.times.length)
+      delete i.tt[n]
+    }
+  }
+
+  let timerThreshold = function(name, timeout, threshold, cb){
+    let i = inst, n = name
+    if(!i.tt) i.tt = {}
+    if(!i.tt[n]) i.tt[n] = {count:1, active:false, timeout:null}
+    let t = i.tt[n]
+    if(!t.timeout) {
+      t.timeout = setTimeout(()=>{
+        if(t.count >= threshold) {
+          if(!t.active) cb(true, t)
+          t.active = true
+        }else{
+          //if(t.active) cb(false, t)
+          t.active = false
+        }
+        t.timeout = null
+        t.count = 1
+      }, timeout)
+    }else{
+      t.count = t.count + 1
+    }
+  }
+
+  let isWholeBufferSilence = function(){
+    if(inst.silenceIndices && inst.silenceIndices.length) { 
+      let silentIndicesLength = inst.silenceIndices.length
+      let dataViewsLength = inst.dataViews.length
+      let minimumSilence = 0.70
+      if( silentIndicesLength > dataViewsLength * minimumSilence ){
+        return true
+      }
+    }
+    return false
+  }
+  inst.isWholeBufferSilence = isWholeBufferSilence
+
+  // create wav
+  function createWav(sampleRate, numChannels){
+    inst.sampleRate = sampleRate || 16000;
+    inst.numChannels = numChannels || 1;
+    inst.numSamples = 0;
+    inst.dataViews = [];
+    inst.silenceIndices = [];
+  }
+  inst.createWav = createWav
+  // delete wav
+  function deleteWav(){
+    inst.numSamples = 0;
+    delete inst.dataViews;
+    delete inst.silenceIndices;
+  }
+  inst.deleteWav = deleteWav
+  // add to wav
+  inst.pauseRecord = false
   function addBufferToWav(buffer){
+    if(inst.pauseRecord || !inst.dataViews) return
     var view = new DataView(new ArrayBuffer(buffer.byteLength)), offset = 0, x;
     for(var i=0 ;i < buffer.length; i++){
-      x = buffer[i] //* 0x7fff;
-      //view.setInt16(offset, x < 0 ? Math.max(x, -0x8000) : Math.min(x, 0x7fff), true);
+      x = buffer[i]
       view.setInt16(offset, x, true);
       offset += 2
     }
-
-    this.numSamples += buffer.byteLength;
-    this.dataViews.push(view);
+    inst.numSamples += buffer.byteLength;
+    if(view) inst.dataViews.push(view);
+    doLogBuffer(buffer)
+    return inst.dataViews.length
   }
-  this.addBufferToWav = addBufferToWav;
 
-  function getBlobFromWav(contentType){
-    var dataSize = this.numChannels * this.numSamples * 2,
-        view = new DataView(new ArrayBuffer(44));
-    setString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    setString(view, 8, 'WAVE');
-    setString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, this.numChannels, true);
-    view.setUint32(24, this.sampleRate, true);
-    view.setUint32(28, this.sampleRate * 4, true);
-    view.setUint16(32, this.numChannels * 2, true);
-    view.setUint16(34, 16, true);
-    setString(view, 36, 'data');
-    view.setUint32(40, dataSize, true);
-    this.dataViews.unshift(view);
-    var blob = new Blob(this.dataViews, { type: contentType || 'audio/wav' });
-    cleanupWav()
-    return blob;
-  }
-  this.getBlobFromWav = getBlobFromWav
-
-  // download blob to local machine
-	// example: saveData(blob, fileName)
-  this.saveData = (function () {
-	    var a = document.createElement("a");
-	    document.body.appendChild(a);
-	    return function (blob, fileName) {
-	        var url = window.URL.createObjectURL(blob);
-	        a.href = url;
-	        a.download = fileName;
-	        a.click();
-	        window.URL.revokeObjectURL(url);
-	    };
-	}());
-
-
-  this.keywordDetected = function(keyword){
-    var inst = this
-    if(keyword){
-      this.lastKeyword = keyword
-    }else{
-      keyword = this.lastKeyword
+  inst.logBuffer = options.logBuffer || false
+  function doLogBuffer(buffer){
+    if(inst.logBuffer) {
+      if(!inst.bufferLog) inst.bufferLog = []
+      for(var i=0 ;i < buffer.length; i++){
+        inst.bufferLog.push(buffer[i])
+      }
     }
-    this.startWav()
-    this.wavStarted = true;
-    this.silenceCount = 0
-
-    console.log('Detected', keyword)
-
-    inst.trigger('wakeword', keyword)
-
-    this.samplingTimeout = setTimeout(function(){
-      inst.wavStarted = false
-      inst.sampleObtained()
-    }, 10000)
-
   }
-  this.audioProcess = function(audio){
-    if(this.wavStarted){
-      this.addBufferToWav(audio.data)
-
-      // detect silence (by sampling)
-      var ssum = 0, idx = 0, samples = 20, silenceThreshold = 50.0, silenceMaxLength = 5;
-      for(var i=0;i<samples;i++){
-        idx = Math.round(Math.random() * audio.data.length)
-        ssum += Math.abs(audio.data[idx]);
-      }
-      //console.log('Silence', ssum / i)
-      if(ssum / i < silenceThreshold){
-        this.silenceCount += 1
-      }else{
-        this.silenceCount = 0
-      }
-      // if silence is detected in more than silenceMaxLength buffers
-      if(this.silenceCount >= silenceMaxLength){
-        clearTimeout(this.samplingTimeout)
-        this.wavStarted = false
-        this.silenceCount = 0
-        inst.sampleObtained()
-      }
-
-      // detect silence (using the audio recorder)
-      /*
-      var silenceMaxLength = 5, continuityThresholdMilis = 1000;
-      if(Date.now() - inst.lastSilence < continuityThresholdMilis){
-        this.silenceCount += 1
-      }else{
-        this.silenceCount = 0
-      }
-      if(this.silenceCount >= silenceMaxLength){
-        clearTimeout(this.samplingTimeout)
-        this.silenceCount = 0
-        this.wavStarted = false
-        inst.sampleObtained()
-      }
-      */
-
+  function bufferToConsoleLog(){
+    if(inst.logBuffer && inst.bufferLog) {
+      console.log(JSON.stringify(inst.bufferLog))
+      delete inst.bufferLog
     }
   }
 
-  this.sampleObtained = function(){
-    console.log('Sample obtained, sending...')
-    inst.stopRecording()
-    inst.trigger('sending')
-    inst.alexaRecognize()
+  inst.audioProcess = function(data){
+    let silence = silenceDetect(data)
+    let dataIdx = addBufferToWav(data)
+
+    if(silence) {
+      if(!inst.silenceIndices) inst.silenceIndices = []
+      if(dataIdx) inst.silenceIndices.push(dataIdx)
+    }
   }
 
-  this.setAccessToken = function(token){
-    this.accessToken = token
+  inst.playSounds_old = function(sounds, cb) {
+    if (sounds && sounds.length > 0) {
+      var i = -1;
+      function playSnd() {
+        i++;
+        if (i == sounds.length) {
+          sounds = []
+          cb.call(inst)
+          return;
+        };
+        sounds[i].addEventListener('ended', playSnd);
+        var prms = sounds[i].play()
+        if (prms) {
+          prms.catch(function(err) {
+            cb.call(inst, err)
+          });
+        }
+      }
+      playSnd();
+    }
   }
 
-  this.getStreams = (obj)=>{
+  inst.initAudioPlayer = function(){
+    let id = 'audio_tag_hidden'
+    let a = document.getElementById(id)
+    if(!a){
+      a = new Audio()
+      a.id = id
+      a.setAttribute('hidden', true)
+      a.setAttribute('controls', false)
+      document.body.appendChild(a)
+      a.addEventListener('ended', function(){
+        console.log('Sample ended')
+        inst.playSound()
+      });
+    }
+    inst.audioTag = a
+  }
+
+  inst.playSound = function(){
+    let sound = inst.playingSounds.shift()
+    let cb = inst.playingSoundsCb
+    if(!sound) return cb.call(inst)
+
+    let a = inst.audioTag
+    let src = sound.src
+    if(!src) return cb.call(inst)
+    try{
+      a.src = src
+    }catch(err){
+      console.log('err', err)
+      return cb.call(inst)
+    }
+    var prms = a.play()
+    if (prms) {
+      prms.catch(function(err) {
+        cb.call(inst, err)
+      });
+    }
+  }
+  inst.playSounds = function(sounds, cb) {
+    if (!sounds || !sounds.length) return cb.call(inst)
+    inst.playingSounds = sounds
+    inst.playingSoundsCb = cb
+    inst.playSound()
+  }
+
+  inst.getStreams = (obj)=>{
     // get a list of streams
     if(!obj || !obj.messageBody || !obj.messageBody.directives || !Array.isArray(obj.messageBody.directives)) return []
     let streams = []
@@ -329,7 +434,7 @@ function AVSaurus(options) {
     return streams
   }
 
-  this.shouldListen = function(obj){
+  inst.shouldListen = function(obj){
     if(!obj || !obj.messageBody || !obj.messageBody.directives || !Array.isArray(obj.messageBody.directives)) return false
     for(let i=0;i<obj.messageBody.directives.length; i++){
       let d = obj.messageBody.directives[i]
@@ -340,11 +445,99 @@ function AVSaurus(options) {
     return false
   }
 
-  this.alexaRecognize = function(){
-    var token = this.accessToken;
+  inst.setAccessToken = function(token){
+    this.accessToken = token
+  }
+  
+  function trimSilence(dataViews){
+    if(!dataViews) return
+    //silenceIndices
+    if(!inst.silenceIndices || !inst.silenceIndices.length) return 
 
+    // splice silent frames from 0 to first frame that is not in sequence
+    let toTrim = [], lastIdx = 0
+    for(let i=0; i<inst.silenceIndices.length; i++){
+      let idx = inst.silenceIndices[i]
+
+      //if(idx > 10 && lastIdx+1 != idx) break
+      if(idx > 10 && idx > lastIdx+10) break
+      lastIdx = idx;
+
+      if(idx) toTrim.push(idx)
+    }
+    //console.log('inst.silenceIndices:', inst.silenceIndices)
+    console.log('Sample frames to trim:', toTrim)
+    if(toTrim.length){
+      dataViews.splice(0, toTrim.length);
+    }
+    delete inst.silenceIndices
+  }
+
+  function getBlobFromWav(opts){
+    if(!opts) opts = {}
+    let contentType = opts.contentType || 'audio/L16; rate=16000; channels=1'
+    let dataViews = opts.dataViews || inst.dataViews
+    if(!dataViews) dataViews = []
+
+    //TODO: revisit silence trimming
+    //trimSilence(dataViews)
+
+    if(opts.prepend) {
+      inst.dataViews.unshift(opts.prepend)
+    }
+
+
+    bufferToConsoleLog()
+    var dataSize = inst.numChannels * inst.numSamples * 2,
+        view = new DataView(new ArrayBuffer(44));
+    setString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    setString(view, 8, 'WAVE');
+    setString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, inst.numChannels, true);
+    view.setUint32(24, inst.sampleRate, true);
+    view.setUint32(28, inst.sampleRate * 4, true);
+    view.setUint16(32, inst.numChannels * 2, true);
+    view.setUint16(34, 16, true);
+    setString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+    dataViews.unshift(view);
+    var blob = new Blob(dataViews, { type: contentType || 'audio/wav' });
+    //deleteWav()
+    //delete dataViews
+    return blob;
+  }
+  inst.getBlobFromWav = getBlobFromWav
+
+
+
+  function getPrefixSample(){
+    return [-9,-19,-23,-21,-8,0,6,2,0,11,9,7,9,12,14,5,11,6,6,11,6,11,6,-6,-7,0,0,7,-1,0,3,8,7,11,18,6,12,5,-1,6,8,9,5,-2,7,4,2,13,5,3,4,0,-5,-4,3,5,1,2,0,2,-3,-2,-1,0,0,7,8,-2,1,11,21,18,2,-15,-14,8,15,1,-14,-11,3,14,1,-10,-15,-6,5,0,-11,-3,3,3,8,5,7,5,8,13,2,-16,-19,-13,-1,-9,-16,-18,-11,-2,-2,-3,-16,-9,-2,-7,-10,-14,-12,-6,-4,5,-3,-5,-5,-12,7,8,-5,-17,-7,-5,-7,-6,-8,-11,-12,-20,-31,-22,-18,-12,-1,1,3,12,23,3,2,6,1,7,10,0,2,14,11,21,24,13,19,15,7,1,-8,6,6,3,11,4,15,12,7,5,-9,-5,3,0,0,4,-6,-6,12,22,19,16,15,13,11,9,2,0,0,8,12,3,0,-5,-4,-9,-18,-13,-12,-2,-1,-2,4,15,16,6,-5,-2,-9,-7,-12,-23,-11,-1,11,9,-3,-3,12,16,18,-3,-5,5,19,6,0,-4,-4,5,2,-1,-6,-7,5,4,-9,-12,-8,0,8,1,-4,-5,-8,-6,0,-9,-17,-13,-6,8,10,-2,-8,-4,-4,-2,-4,-9,-8,2,2,-1,-2,-1,7,1,-11,-7,-14,-12,-15,-8,-6,-13,-8,1,-1,-10,0,-5,-3,-1,-5,-6,0,10,9,0,3,-1,4,11,3,10,10,12,23,18,17,12,5,5,4,6,0,-1,3,10,8,11,7,-4,2,0,-14,-6,0,2,4,0,-2,0,8,3,1,-11,-20,-8,-8,-10,-14,-2,2,13,11,7,1,-11,-12,-7,-15,-19,-7,4,7,9,0,5,3,-2,-1,0,-4,-5,1,1,3,3,7,5,3,-4,-17,-12,-12,-1,0,-6,-1,2,7,6,6,-2,-11,-6,3,3,1,-1,12,12,10,5,0,5,-1,-5,-9,-3,12,11,14,14,13,6,-5,-10,-15,-10,-10,0,0,5,10,8,5,8,16,-3,-5,0,-3,4,4,3,-4,4,11,3,3,-9,-4,-4,-13,-2,-10,-11,-1,4,10,0,-2,7,3,3,-7,-6,1,6,9,-5,3,3,-2,4,1,-3,-3,2,0,-7,0,13,8,0,1,1,1,2,0,0,8,9,2,4,0,0,-2,-6,4,5,-9,-4,0,-6,-17,-10,-3,-12,-4,0,-6,-5,0,-6,-15,-10,-10,-5,2,3,-3,-9,-6,-2,-3,-4,0,3,-2,-3,2,0,-6,-2,12,4,-2,-1,-1,1,5,0,1,14,12,4,-3,-3,-2,0,3,-2,7,12,13,14,9,8,1,-1,-1,-3,0,-12,-5,0,0,5,13,20,-2,3,4,-13,-8,1,2,-4,0,0,-5,1,-2,-9,-8,-4,-1,7,0,-6,4,10,11,5,-4,-5,-3,2,-1,-9,-5,4,9,6,4,-4,-2,7,-5,-10,-2,0,-4,2,2,-2,11,9,-1,-1,-10,-10,-8,-6,11,-1,-8,-8,1,5,2,2,-4,-12,0,7,4,7,6,5,-4,1,-1,-6,-5,-6,-2,-5,-6,-9,-8,-4,1,-6,-11,0,-3,-3,-1,3,-1,5,6,-2,6,10,13,7,0,2,5,5,5,0,-5,-3,2,-2,1,8,2,-1,2,0,-4,-1,-7,-2,1,1,16,10,6,11,0,3,8,7,6,5,4,-2,4,5,0,4,0,-3,-4,-7,-10,-9,-2,0,1,-3,3,-1,-1,-3,-9,-11,-12,-11,-5,9,9,15,22,8,-7,0,6,-1,-4,-5,-14,-9,0,13,12,-1,-3,-10,-4,2,-4,-7,-4,-1,-2,-4,-1,5,0,-13,-11,-14,-12,1,6,5,8,9,11,7,0,-10,-16,-6,-9,-7,0,4,7,9,10,1,0,0,-4,0,6,0,-1,3,0,2,6,-4,-13,-15,-13,-9,0,2,3,10,1,4,9,2,3,3,2,0,3,12,15,14,8,8,0,2,14,3,10,9,5,2,0,-3,-6,1,-10,-11,-10,-14,-13,-14,-5,-1,2,0,-4,-4,-10,-5,-6,-7,-5,0,1,0,11,5,5,5,8,2,-14,-10,-6,0,2,4,8,-1,-8,-8,-6,-6,-10,-5,-3,-4,0,5,0,3,10,2,-2,-10,1,0,-13,-3,10,16,10,8,11,12,9,13,12,8,12,2,1,5,9,6,-10,-4,-8,-13,-9,0,-7,-9,-2,-1,-1,-2,6,-2,-4,3,-4,-6,1,9,8,6,15,13,10,8,8,5,3,8,6,0,-9,-1,-6,-5,-4,-12,-5,-3,-1,-7,-12,-8,-9,-6,-13,-5,-16,-14,-11,-3,1,0,0,7,8,2,7,2,8,17,6,-1,0,1,-4,-3,0,-4,-6,-3,1,-5,-13,-4,-9,-7,-1,0,1,1,2,-3,-5,-2,-1,0,1,1,6,6,9,10,11,12,13,4,-2,7,-2,-12,-10,-4,0,-4,4,5,1,1,2,-1,-6,-1,0,0,0,-4,-9,-6,1,7,8,0,5,6,3,9,9,10,6,1,-1,-4,0,7,4,-1,-10,-13,-1,-10,-15,-7,-9,-5,-1,-3,1,0,-1,-3,2,-1,1,2,17,13,10,14,9,12,5,7,11,10,8,3,-3,-8,-3,-9,-8,-8,-8,-4,-5,-7,-8,-1,-13,-10,-11,-4,-3,1,1,-3,-9,-1,0,1,4,2,1,3,6,10,5,6,2,2,0,-4,-2,-10,-10,-3,0,-1,1,4,-3,-4,-10,-9,-15,-6,0,3,6,1,2,2,0,1,-3,-4,-4,6,-6,3,11,2,10,11,7,-5,-2,-3,-6,-7,9,11,8,8,12,0,-2,1,-1,-12,-11,-3,-5,-9,2,6,5,4,5,-2,-6,3,7,8,10,10,8,5,15,5,-2,-8,-4,-8,-9,0,-1,-4,-2,-6,-9,0,5,3,-5,-9,-13,-12,-17,-7,-1,0,0,10,11,5,6,3,-1,2,-4,-2,-2,-2,5,9,7,8,0,-1,-5,-1,2,-2,2,11,0,0,9,3,3,1,-3,-4,-7,-5,3,4,7,9,10,0,1,-4,4,1,-1,0,2,7,4,4,2,0,-4,-7,-13,-10,-5,-2,6,0,0,-1,0,-5,-4,-6,-5,-5,-6,-6,-2,0,10,9,5,2,-5,-15,-12,-5,-7,-10,0,4,10,10,1,-2,-3,2,2,-6,0,-2,-4,-3,0,0,-2,0,-8,-1,-1,4,1,4,8,1,12,8,-1,4,2,-2,-6,-6,-6,2,10,8,6,2,11,9,-10,-6,-4,-2,1,6,5,0,2,6,2,5,2,0,-1,4,3,7,11,4,2,5,1,0,-5,-6,-5,-2,-3,-4,-7,2,4,-1,0,0,-4,0,-5,-8,-10,-8,-5,-2,1,-3,0,0,-4,-2,-2,-5,-1,-4,-2,-2,2,4,7,9,0,-2,-7,-9,-3,0,0,2,5,6,3,1,-8,-8,-2,0,3,1,6,4,3,7,-4,0,2,0,-4,-10,4,-1,-7,-4,-5,0,2,4,-7,-5,-1,0,0,0,-1,5,4,2,0,0,2,1,2,0,4,7,3,7,7,13,10,9,3,-1,0,3,1,2,5,6,8,6,3,0,-3,-6,-8,-7,-2,0,0,-7,-3,0,0,-1,-1,0,-8,-4,2,-3,2,3,0,1,1,0,-2,-4,-4,0,-5,-7,-1,-8,-7,-3,-3,-6,-4,3,1,0,0,-1,-1,-2,0,0,6,8,9,4,0,1,4,0,2,-3,6,6,1,0,2,0,-2,-5,-4,2,4,2,1,-6,-7,-7,-12,-5,0,-5,-8,-8,-11,-7,-8,-5,-1,0,-5,-4,-2,0,-2,0,2,3,3,0,2,3,1,-2,-3,0,0,-1,-4,-3,2,3,1,2,1,5,0,11,8,3,6,2,6,12,10,10,10,9,1,4,5,7,3,10,4,4,10,1,1,5,4,3,6,1,0,-4,-8,-5,-8,-5,-3,-6,-4,-4,-7,-7,-8,-5,-10,-6,-11,-10,-4,-1,-1,0,-3,-7,-6,-3,-13,-10,-12,-15,-12,-3,-3,-4,2,0,3,-1,1,-3,-6,0,-5,-2,1,0,4,1,-3,1,0,0,7,5,4,12,15,10,16,11,11,4,16,9,7,11,9,8,2,2,10,8,4,7,4,0,-1,1,2,6,3,9,4,4,5,0,0,2,4,0,-1,0,0,-1,-2,-9,-9,-7,-13,-10,-7,0,0,-9,-10,-5,-6,-1,2,5,-1,2,0,1,0,-10,-2,-5,-4,-8,-7,5,2,2,1,4,1,-7,-5,0,-1,-2,-7,-7,-2,3,2,-8,-5,-5,0,-3,-2,-6,4,7,4,-2,0,-1,-1,-4,0,-2,-3,-1,0,-4,-11,-8,3,-1,-6,-5,-9,-10,-2,-11,-8,-1,-3,0,8,6,9,10,13,11,12,11,8,9,11,8,6,12,10,8,10,3,3,4,5,4,3,2,0,2,3,1,9,6,8,6,9,2,0,6,0,-1,-3,-4,-4,0,-1,-2,-1,-5,-2,-1,-2,-1,-3,-4,-9,-7,-5,-7,-1,-1,-3,-1,0,-2,7,1,-9,0,3,0,-1,1,5,0,-7,-4,0,2,0,0,-4,-8,-3,-7,-3,-8,-4,-7,-3,-5,-5,-2,-8,-4,-1,-5,-7,-2,0,9,3,-1,3,4,2,3,8,0,0,0,-1,0,-2,1,-3,7,4,-4,3,5,10,4,-1,0,-1,3,2,8,2,6,6,4,-4,0,-2,-1,-6,-5,-6,-1,-3,3,7,6,0,1,-2,5,5,5,3,5,10,16,10,-6,-3,4,0,-1,1,0,5,9,1,7,3,2,-6,-5,-8,1,-1,-2,-4,-3,4,5,-3,-2,4,-3,6,-7,-3,-8,-7,-3,1,-6,0,-1,-6,4,-5,10,-1,-6,-4,-1,-1,0,-8,-6,-4,21,-19,-63,122,103,-449,83,58,6,-13,23,-1,-21,0,2,0,16,-2,3,12,-5,-4,1,6,5,12,8,8,4,5,24,-4,6,-6,6,3,-4,-8,-4,-1,-1,3,0,0,-4,1,-30,11,-5,-13,19,-7,1,-1,-22,4,-1,-10,7,-6,-5,-10,-9,-1,-4,-6,-9,-7,-3,1,0,-5,-6,-2,0,-7,-8,-10,4,-8,-4,3,-1,-7,0,0,-4,11,6,0,0,5,5,6,0,13,0,-5,7,7,9,6,5,12,12,9,3,7,3,5,-2,4,0,-2,-1,-9,9,8,-29,25,18,-12,-9,23,1,-8,-4,1,-7,-6,-3,-5,-2,0,0,5,-4,0,7,8,-4,0,0,-4,-5,-3,-2,0,0,-3,-2,6,0,9,7,7,11,3,8,5,19,5,3,9,2,7,4,3,-1,0,-2,-1,4,-3,1,0,2,-1,-4,7,-2,3,3,-4,1,-3,-5,-2,-9,-9,-12,-7,0,-17,-12,-12,-10,-12,-16,-6,0,-7,-1,-8,-4,0,-10,-6,-4,-12,-3,1,0,2,1,0,5,8,5,7,7,-10,5,4,-1,-13,12,7,1,8,11,2,1,6,12,6,4,3,14,2,3,5,8,9,2,2,7,7,7,7,14,3,-1,-2,4,-7,-6,0,2,-2,-9,-16,-19,-4,0,-7,-3,4,7,6,-1,-5,-3,0,5,-9,-9,-3,3,-3,-3,2,-3,-6,-4,0,0,-1,-2,-4,-1,-1,-3,2,8,2,0,3,0,3,4,2,0,0,5,2,7,4,-2,-2,-6,0,-2,-4,-4,-2,6,0,1,-1,-2,3,2,4,-1,3,4,2,-4,0,-4,-2,1,4,3,0,5,-1,0,2,-13,-11,1,2,-13,-6,0,3,-4,0,0,-2,-1,0,0,4,7,2,2,1,1,-5,5,1,-2,-4,-1,3,2,-3,0,0,0,0,7,3,0,-3,2,1,6,5,-2,-4,-1,0,-1,-5,-3,-3,-4,-3,-2,1,-4,-4,1,8,10,-2,4,7,-6,-7,-4,-7,-12,0,0,-4,-12,-7,2,0,-1,-3,-1,1,1,4,0,-1,0,1,0,0,0,6,9,10,7,2,9,3,-1,2,-2,0,-3,-9,-2,0,1,0,4,4,5,10,5,5,7,2,2,0,-5,-8,-11,0,1,-3,-2,0,-3,3,1,2,1,3,15,-2,-10,-8,-4,-7,0,7,8,6,6,4,0,-2,-1,-1,-5,0,2,3,0,-9,-7,-3,-9,-2,0,0,6,5,4,-5,1,1,-1,0,0,7,9,3,3,-1,0,0,3,0,-1,-5,-4,-2,0,0,-8,-2,0,0,8,6,4,0,-1,2,-3,-7,-9,0,-2,-3,-5,-4,-6,-3,2,-2,-1,1,2,0,-2,0,-2,-2,-4,-1,-1,1,-5,-1,5,1,1,4,7,9,3,0,-1,0,4,1,5,2,2,0,-2,1,7,6,0,-3,3,1,2,6,2,-3,0,1,-2,-2,-2,1,0,-1,0,-2,-4,-2,-4,-2,2,5,5,2,-1,-2,0,3,2,0,3,4,2,0,0,0,-6,-8,-7,-5,0,-2,-5,-2,-4,-2,-2,0,-1,-5,0,-3,-8,-6,-9,-8,-7,-5,-2,0,3,2,2,2,2,8,4,8,9,12,6,5,12,9,5,4,9,11,9,12,6,6,5,-2,-3,0,2,-1,0,1,2,-1,-2,-8,-9,-8,-8,-4,-8,-19,-12,-6,-6,-6,-5,1,-5,-3,-3,-7,-7,-6,-3,-7,-8,-3,-2,-2,-1,3,3,8,7,11,8,9,11,8,6,2,4,0,0,8,4,4,4,0,4,0,-2,2,2,0,-5,-4,-1,6,2,-1,-2,1,1,1,-2,-6,3,6,4,8,7,5,1,2,4,1,-1,-7,-7,-3,-2,1,0,-1,-1,-7,-9,-6,-7,-7,-7,-9,-4,-1,-4,-4,-6,-1,1,6,0,1,3,1,0,0,1,0,0,2,6,9,9,1,4,3,5,6,5,3,4,3,-5,-8,2,3,-5,-7,0,5,4,5,2,-6,-4,-4,-4,-3,1,0,0,0,3,1,0,0,-3,-8,-3,-5,-2,-5,-8,-4,-5,-2,-9,-4,-1,-2,1,0,5,8,0,0,-2,3,5,3,-1,-2,2,-1,-1,0,0,-6,-9,-4,-2,1,-1,3,0,-1,1,-1,-2,-1,0,0,-1,0,-2,-4,-1,-1,8,5,6,10,7,0,9,15,8,6,9,15,6,6,9,6,0,-3,1,2,0,-1,1,4,3,1,0,-3,-3,-6,-6,-7,-8,-4,-5,-3,-3,-5,-6,-6,-7,-9,-9,0,6,5,-5,-3,-9,-5,-9,-6,0,-7,-4,0,1,3,6,8,7,13,10,2,0,0,-1,-2,-1,-1,-3,1,2,6,1,-1,0,3,4,-2,2,2,2,5,4,-1,-6,-4,-4,0,-1,-1,0,3,7,8,6,2,0,0,-3,-2,-5,-1,1,0,3,3,5,0,0,1,3,6,9,9,15,4,0,4,5,10,6,0,-9,-10,-9,-7,-12,-7,-4,-4,-7,-3,-1,-7,-6,-5,-8,-7,-8,-10,-9,0,0,-2,-4,-4,-3,-4,-4,2,3,2,3,2,7,5,0,0,2,-4,-2,2,2,-3,-4,-2,1,0,-2,-1,0,1,4,4,0,-2,-1,0,-2,-1,5,8,9,4,8,12,11,7,4,1,4,3,-1,1,-2,0,-6,-12,-4,-2,0,0,-5,0,2,5,6,-5,-3,0,2,3,0,2,7,2,-4,-5,-5,-6,-7,-2,-3,-3,3,0,3,-1,-4,-1,1,0,-3,-2,0,0,2,3,4,0,1,5,6,7,13,11,10,12,8,7,11,8,1,-1,2,3,-4,-11,-8,-7,-4,-6,-8,4,-1,-1,-2,-6,-5,-7,-2,-4,-3,0,-2,-1,-3,-3,-2,-3,-3,-2,-5,-5,-8,-9,-11,-3,1,-3,-4,-2,-2,-3,-2,-3,0,0,0,-3,4,0,-1,4,0,-2,0,5,10,7,8,14,14,8,4,3,-2,-2,0,0,0,0,-2,0,0,0,-2,-1,0,3,7,13,13,7,5,6,4,6,-1,-3,-4,-2,-3,0,-1,-7,-5,0,-3,0,0,-1,2,5,-1,1,0,4,3,-5,-1,-5,-7,-4,-7,-4,-1,-1,5,1,4,-3,-3,2,0,-1,0,-7,-8,-9,-3,-9,-7,-3,-1,-2,0,0,2,3,-1,-4,-1,2,2,5,2,-1,-1,3,4,5,9,11,8,5,7,5,6,3,4,2,-3,0,2,0,-5,-3,0,-1,0,1,0,-5,-5,-6,0,-2,-4,3,0,0,-7,-7,-8,-5,-3,-1,-2,-3,-3,-6,-4,-3,-11,-8,-5,-6,-4,-5,0,2,1,0,0,0,7,8,12,14,15,7,1,5,2,0,2,-3,-2,8,5,8,11,5,5,6,4,-1,-1,2,8,10,5,6,1,-4,-2,-2,-2,0,3,0,1,0,-2,-6,-4,-2,-1,-4,-9,-8,-5,-2,-1,0,5,1,-6,-9,-8,-3,0,-1,-3,2,0,-2,-2,-8,-6,-4,-1,-3,0,6,1,-3,3,8,5,1,6,7,3,2,0,0,-8,-8,-2,-5,6,2,-1,0,2,5,2,-1,-2,0,-4,1,4,8,5,0,-4,-2,-4,-2,-5,1,-2,1,4,4,0,-2,-8,-5,-2,5,0,0,1,-4,-2,-11,-14,-8,-8,-4,-3,1,4,8,9,5,6,-2,0,4,4,6,5,4,3,5,0,5,3,1,0,0,0,-4,0,0,-2,-4,-5,-6,-8,-4,1,0,4,0,-2,2,12,9,0,-3,-7,-2,4,5,4,0,0,-3,-5,-3,-2,4,5,7,-3,-3,-5,0,-2,1,-4,-1,2,0,2,11,5,4,-2,0,-2,-5,6,9,4,4,4,4,1,-2,-2,-4,-7,4,2,0,0,-7,-5,-8,-6,1,-7,0,4,-1,-5,-6,-3,-6,-5,-1,0,3,2,3,4,4,3,2,0,1,2,7,1,3,0,-2,-5,-3,-5,-7,-6,-5,-1,-2,4,3,-1,-3,-4,-2,-1,0,3,4,4,0,0,4,-2,-3,-2,2,3,6,4,10,3,0,3,6,0,0,1,1,-1,-4,-6,0,2,-2,-3,-4,-8,-8,-9,-8,-1,-4,-5,-3,-3,0,0,0,0,-5,-3,3,2,2,0,1,1,1,0,-1,4,4,4,3,9,10,6,3,9,7,3,5,2,3,10,6,5,2,-2,0,6,1,-2,-5,-9,-6,-7,1,-7,-1,3,1,0,1,4,0,0,-4,-4,-4,-1,-4,-2,-1,-2,-4,-6,-7,-5,-6,-2,0,-1,-1,0,1,3,0,-1,-3,-3,-1,-1,5,2,-2,3,11,7,5,3,7,5,-2,-3,1,3,4,6,2,-5,-7,-4,-7,-10,-8,-4,-1,-4,-8,-4,0,-3,-9,-3,2,0,3,6,5,7,2,3,3,1,3,7,14,13,10,5,7,6,0,2,0,0,1,3,9,10,6,-1,0,3,-1,-3,-5,-5,-12,-13,-9,-5,-2,-8,-1,0,0,0,0,-3,-3,1,3,2,0,-3,-5,-1,0,-5,-6,-8,-3,0,-3,3,-2,-3,-4,0,-2,-2,3,2,6,5,2,-4,2,6,0,0,1,1,-1,-3,-2,0,3,-2,0,2,-2,0,0,0,-2,0,2,0,0,1,2,0,7,6,3,0,7,8,4,-4,0,0,5,10,4,-3,-5,0,-5,-2,0,3,7,1,0,1,5,0,0,-2,-3,-2,-3,-1,-5,-1,-2,-3,-2,-4,-5,-3,-2,-3,-5,0,-1,1,0,0,2,2,1,-1,-1,2,0,10,5,5,1,0,2,-3,-1,-4,0,2,0,2,0,-2,-1,0,5,5,-2,-2,6,7,1,-1,0,5,4,3,-1,-1,1,-2,-2,0,-1,-5,-6,-2,-3,-1,-3,-1,0,-2,-2,0,1,0,0,-1,1,0,-3,0,-4,0,1,2,1,0,-2,0,8,2,0,1,1,0,3,2,-1,-3,0,6,2,-1,1,0,-4,0,3,1,-6,-2,0,-8,-5,-4,-5,-2,-4,-3,-5,-3,0,0,1,-2,2,1,4,5,1,3,3,2,-1,-1,2,5,-1,-3,5,2,1,0,2,3,1,0,-2,-2,-5,0,2,2,2,0,0,-1,-1,-4,-2,-3,1,6,3,2,4,3,-2,-4,-2,2,2,0,-1,0,5,0,-8,-2,3,3,1,0,1,2,5,9,8,7,7,6,3,1,2,-5,-7,-1,3,4,2,0,-1,-8,-7,-4,-2,-3,-7,-5,-4,-7,0,-1,-11,-11,-8,-6,-3,-1,-6,-3,2,-1,3,7,6,4,-2,2,1,-1,-1,-1,2,0,-1,1,2,0,-1,2,3,3,6,6,6,1,1,1,-2,-5,-5,-9,-6,-2,0,-1,0,-4,0,2,2,2,3,0,-2,3,3,2,-1,-4,4,5,5,4,5,4,1,1,4,1,1,-1,-1,2,-1,-1,0,-1,-1,2,-1,-8,-3,2,0,1,4,5,5,1,0,2,2,6,-3,-4,-2,-3,-8,-10,-8,-7,-4,-4,-1,3,-1,-1,9,9,6,2,1,7,6,-1,-9,-3,0,-3,-7,-5,-2,0,0,2,0,-6,-5,0,-1,-7,-1,5,-1,-1,-6,-5,-5,-2,2,2,0,0,4,3,0,0,2,7,7,11,6,6,1,-3,5,-1,-2,0,0,0,-4,-6,0,1,-2,0,0,2,0,-3,0,-2,-6,-1,1,5,2,0,0,-1,3,4,2,-1,-1,4,5,6,6,3,1,0,-1,0,-2,-3,0,-6,-3,-2,-3,-2,1,2,-2,0,1,2,-4,-3,1,-2,-2,-3,-5,0,4,5,-2,-9,-4,6,3,0,0,3,0,3,8,5,5,5,2,3,0,0,2,-3,0,3,1,-7,-11,-3,0,-2,0,-1,-5,-3,-1,-1,-2,0,-1,-2,0,0,1,-3,-8,-5,-3,2,-1,-6,0,0,-1,-1,-5,2,9,3,0,3,1,0,7,1,1,4,4,0,1,6,3,4,4,7,1,1,3,2,4,3,5,4,4,4,1,2,5,0,0,-1,-5,0,1,-1,-2,-2,-4,0,0,-1,-6,-7,-6,-6,-3,-1,0,-2,-4,-9,-4,0,-2,-1,0,0,-5,-4,-2,-1,-1,1,1,-1,2,2,0,6,5,3,5,1,-4,-1,3,2,-4,-6,-7,-3,2,2,0,-4,-3,-3,-1,1,-3,-4,-5,-5,-6,2,1,-4,-1,3,4,4,3,6,8,11,8,1,-1,0,2,7,2,0,3,2,-3,-2,1,0,0,1,0,0,0,2,4,5,3,4,1,-3,-3,-1,1,6,7,3,1,2,0,2,-1,-4,-6,-3,5,4,-2,0,0,0,3,1,0,-5,-4,0,0,0,0,-3,-5,0,3,1,-3,-5,-4,-6,-11,-10,-7,-13,-7,-7,-7,4,1,-2,0,2,5,2,0,0,0,-1,1,2,2,4,2,3,6,2,-1,0,-2,0,6,2,0,-2,-4,0,0,2,2,0,0,7,5,0,0,-2,-2,-2,-3,-1,-1,-3,-3,-3,0,1,-1,0,0,2,7,7,3,5,5,5,8,5,2,4,3,6,9,5,7,1,-3,-1,-8,-5,0,-7,-8,-3,-2,-1,0,3,0,-1,1,0,-8,-9,-3,-2,-4,-5,0,-3,-3,0,2,0,-4,-4,0,2,3,-1,-3,-2,-2,0,2,3,2,1,1,4,4,4,5,3,4,4,-5,-2,2,0,2,5,-1,-3,0,0,1,0,0,5,-4,-19,-22,-12,-6,-20,-22,-11,-6,0,3,8,14,23,16,8,13,19,22,21,16,19,22,13,7,10,11,12,3,-3,-1,1,4,-5,-11,-10,-8,-11,-15,-17,-14,-9,-5,-13,-13,-16,-16,-18,-12,-10,-9,-7,-7,-5,0,-2,-2,3,7,3,4,8,10,9,8,12,16,26,23,19,19,16,16,17,8,4,8,1,0,0,-3,-5,-4,-9,-17,-20,-18,-18,-20,-26,-23,-23,-22,-18,-17,-13,-11,-12,-10,-8,-5,-4,-1,0,5,13,19,17,21,19,17,17,21,17,20,12,11,9,5,4,0,-1,-6,-10,-3,-3,-3,0,0,-2,-5,-7,-6,-9,-13,-11,-5,-5,-6,-2,-2,-3,-3,-3,-3,-4,0,-1,-5,0,-1,-9,3,2,1,4,3,0,-1,3,6,5,8,6,7,10,8,7,5,4,2,5,3,1,3,2,-2,-1,-1,-1,-1,-6,-7,-8,0,-2,-3,-3,-6,-3,-1,-2,-1,0,-3,-6,-1,-3,-3,-4,-2,2,5,4,7,8,5,3,7,3,-1,2,6,0,-6,-7,-9,-5,-5,-5,-2,4,1,-7,-8,-8,-4,-2,-1,0,1,-5,0,3,0,0,0,2,1,2,-2,-6,-4,0,5,2,0,3,4,4,3,3,2,2,3,-1,0,0,3,-6,-4,-6,-5,-1,5,4,6,10,15,9,-2,1,1,-1,0,4,4,3,7,6,6,4,-1,-4,-3,-5,-4,-4,0,0,1,5,3,2,0,0,-1,-4,-7,-8,-12,-17,-11,-9,-10,-8,-11,-14,-12,-7,0,4,0,0,0,4,7,6,8,7,8,13,16,12,6,7,10,8,5,1,0,-2,-2,-1,-6,-2,-7,-4,-3,-6,-5,0,1,0,2,0,5,5,0,0,4,1,0,0,-4,1,4,8,1,1,1,3,1,0,-3,1,8,6,4,5,1,1,0,-3,-7,-6,-7,-11,-12,-14,-11,-12,-7,-7,-5,-8,-2,0,0,2,2,2,5,6,11,8,0,0,2,3,0,2,4,0,2,-2,-4,-5,-1,0,0,-1,0,2,3,2,1,-1,-4,-3,-4,-1,-5,-7,-5,-2,0,-6,-1,1,6,7,7,10,13,11,6,4,5,3,6,1,0,0,0,3,5,3,6,0,-1,-1,-5,-7,-9,-7,-11,-9,-9,-4,0,2,-2,-1,0,-1,-4,-7,-7,-4,0,0,-1,-1,3,3,5,1,7,8,10,7,6,8,4,5,-2,0,1,-1,-5,-6,-4,-5,0,0,-10,-8,-6,-8,-3,-6,-6,-3,-4,0,6,6,3,1,4,6,5,0,1,3,0,1,7,1,0,-1,0,0,1,3,4,0,0,0,2,-1,-3,-2,-2,0,0,0,-1,1,6,5,0,-6,-6,-3,-3,-1,0,5,7,8,4,4,6,2,2,0,0,-1,-3,-3,-5,-4,-1,-1,0,0,-2,-2,-1,1,-1,-1,-2,-9,-7,-6,-4,-1,0,0,3,3,4,3,4,4,5,0,0,2,2,1,0,0,0,1,2,6,4,3,3,2,2,-1,-4,-2,-1,-2,-6,-4,-2,-4,0,0,0,0,-4,-6,-6,-8,-7,-7,-7,-3,-1,0,3,5,7,7,7,3,0,0,0,-1,-1,0,2,1,0,1,0,0,2,4,5,4,7,5,2,0,-2,-2,-3,0,3,5,3,2,3,1,-3,0,0,0,-3,-4,-6,-5,-2,2,0,0,0,0,2,-2,-3,-1,-4,-1,1,-2,-4,-2,-3,-3,-2,-3,0,6,5,6,7,5,3,0,0,0,0,2,5,4,4,4,3,-1,0,1,-2,-4,-2,-1,-1,0,0,1,4,-1,0,0,2,2,-1,0,-3,-2,-4,-6,-4,-5,-5,-6,-3,1,-1,-2,0,-2,1,0,0,-1,0,1,0,3,-1,2,0,0,-4,-5,-2,-3,-1,-2,0,2,3,1,0,1,0,-2,-2,0,-2,0,0,0,3,0,6,4,-4,-2,0,2,-1,-2,2,2,0,2,6,4,3,4,5,2,1,3,4,1,3,3,0,1,3,2,-1,-2,0,2,1,0,0,1,3,2,2,0,0,2,0,-1,0,-4,-2,-1,-1,-3,1,-2,0,1,-2,-1,-1,-1,-3,-8,-9,-2,0,1,0,-3,0,0,-2,-2,-3,-3,-1,1,0,1,0,0,1,0,-1,1,-5,-2,3,5,-1,0,3,4,3,-2,-2,1,0,-3,-4,2,0,3,4,0,-2,0,-2,0,-1,-4,0,5,4,8,5,4,2,-1,-1,-5,-5,1,1,-5,-5,-2,-4,-2,-3,-1,-3,0,-1,-1,-1,-1,4,5,2,0,-1,1,4,2,2,3,4,0,0,0,-2,-1,1,-2,-2,0,-3,0,2,1,0,1,2,4,-2,1,0,3,6,0,1,0,0,0,0,2,-2,-2,-5,-1,1,0,0,-2,0,-4,-4,0,-1,-1,4,4,0,3,0,0,0,-2,-3,-2,-3,-5,-4,2,2,0,0,0,0,-2,-4,0,-5,-4,0,-5,-5,-2,-3,-2,-3,1,1,2,3,2,1,2,1,2,3,0,0,2,4,3,3,7,4,1,2,4,5,0,1,6,2,0,5,4,4,2,1,0,-1,0,0,0,1,0,0,0,-1,-7,-5,0,-4,-1,3,-2,-3,1,4,2,0,0,0,-3,-4,-2,-1,-1,0,-3,-6,-9,-5,-2,3,3,-3,0,2,0,-1,-3,-2,-2,0,1,-2,-1,0,5,7,4,0,0,0,-2,-4,-1,2,6,8,6,5,3,4,4,0,-5,-7,-3,0,0,2,1,0,2,3,0,0,1,3,4,0,-1,2,3,0,-4,-2,-4,-5,-1,0,0,0,1,-1,-2,-4,-6,-6,-7,-7,-6,-1,-2,0,4,1,-4,0,3,0,-4,-2,-1,3,2,1,3,0,0,0,-1,-3,-5,2,1,5,4,0,5,6,1,0,1,-1,0,5,1,0,0,2,5,-1,-2,2,1,0,-1,0,2,4,4,4,3,1,-1,0,0,-1,-1,1,4,2,0,-3,-6,-2,1,0,-4,-2,1,0,1,1,0,1,1,-2,-1,1,-1,-5,-1,4,1,2,2,2,3,3,0,-1,0,0,-1,-6,-7,0,0,-2,-1,-2,0,1,2,0,-1,0,1,1,1,-1,0,3,-2,-4,0,0,0,0,0,-2,-2,-2,-4,0,-2,-5,-1,-3,-4,-1,0,-3,-3,-1,-3,0,-1,-4,-2,1,3,6,11,6,6,6,4,6,5,4,1,4,3,0,0,-4,-2,4,5,-1,-1,0,-2,0,-2,0,2,4,3,0,-2,-2,-1,0,-1,-4,-1,2,0,3,-5,-6,-3,-3,-2,-3,-2,0,3,2,-1,-2,-1,-2,-2,0,-3,0,4,7,8,-2,-4,-2,0,-1,-1,1,3,2,1,0,-1,0,-3,-4,-2,-1,0,-1,-1,0,-2,0,0,-2,-2,0,2,0,1,0,1,4,4,5,3,4,5,6,2,0,-1,-4,-3,0,0,-1,-2,0,1,2,1,-3,-4,-5,-4,-3,0,0,-3,0,-1,-4,0,2,-1,-5,0,3,4,6,0,-2,-1,-1,0,-4,-4,-3,-2,0,-1,0,0,4,7,3,4,2,2,2,2,9,5,4,3,4,1,-2,-3,-2,0,-2,-2,-5,-2,-2,-2,1,2,4,-2,-4,-2,-4,0,1,3,0,1,3,0,1,1,0,0,0,1,-1,-2,0,0,-1,-2,-5,-8,-4,-3,-5,-3,-5,0,-2,-5,-3,-1,0,-1,-2,-1,1,0,-1,-2,-1,0,0,-2,-2,0,0,0,1,0,-3,-1,0,1,-1,2,4,3,9,7,6,4,2,1,2,3,2,0,0,-1,-1,6,2,-2,0,-3,-4,2,5,-1,-2,-5,-5,-3,-2,0,1,5,0,2,4,2,1,0,2,2,5,6,7,7,1,0,-2,0,1,4,3,3,1,0,-3,-2,-1,-1,-1,-1,-3,0,2,1,4,2,1,0,4,1,0,0,0,2,0,-1,-3,-4,-1,-5,-2,-2,-2,0,-1,-1,-4,-5,0,-1,-3,-3,0,0,0,0,-1,-3,0,0,0,0,-1,-1,0,3,0,0,-1,-6,-6,-1,-5,-7,-1,0,0,0,0,4,3,1,0,3,7,1,2,4,3,1,0,-2,0,2,2,4,6,6,2,0,-3,0,1,0,-2,-2,-2,2,1,3,1,3,2,0,5,4,4,2,-4,-4,0,0,-1,0,-2,-7,-3,0,0,0,-2,-3,-3,-5,-3,-4,-2,0,0,0,1,3,3,2,2,3,-3,1,2,-1,-6,-1,-1,-6,2,-3,-5,-1,1,0,-1,4,1,0,0,0,-2,-1,-1,-4,-5,-4,-6,-2,0,-4,0,-1,-2,0,5,5,2,4,3,4,0,0,-1,0,0,0,2,1,0,2,4,6,4,6,5,2,2,3,0,1,-1,0,0,-2,-1,-1,0,0,5,0,0,0,2,5,3,6,8,0,-3,0,3,4,-1,-2,-3,1,9,7,7,6,3,5,4,2,2,0,-1,-5,-6,-4,-4,-5,-6,-6,-6,-5,1,0,0,-1,-2,-1,-4,-2,-5,-7,-8,-6,-7,-7,-4,-3,-5,-4,-1,0,1,-3,-5,-2,-1,0,-1,0,-1,-1,-1,-3,0,3,0,-1,2,1,3,4,4,4,4,0,4,1,5,6,3,2,1,2,0,1,0,0,0,2,2,2,3,1,0,0,1,-1,-1,-2,0,2,-1,0,0,-2,-2,-4,-4,-5,-3,1,-2,0,0,-1,2,1,0,2,4,3,0,-1,-4,1,4,0,0,-2,1,-1,-1,-4,-1,0,-3,1,5,6,4,3,0,1,0,0,0,5,5,3,1,4,5,4,0,2,4,4,2,-1,0,-1,0,-2,-3,-2,-1,-1,0,0,0,0,1,0,-4,-3,-7,-2,-1,-3,-4,-3,-1,-2,-4,-4,-7,-8,-3,-3,-2,-3,-4,-5,-1,-1,0,0,0,-1,0,-2,0,-1,2,0,0,1,-1,1,0,2,5,2,0,0,1,0,0,4,3,2,4,-1,1,1,0,-1,-1,1,2,1,3,2,4,5,8,4,1,6,0,0,-1,0,-1,-3,0,0,2,1,-1,-1,0,0,-2,0,2,1,1,0,0,3,0,0,0,-3,-4,-3,2,3,0,0,0,4,5,0,-1,-1,-2,-2,-3,-5,-2,1,-3,-6,-6,-3,3,0,1,0,1,1,0,1,1,1,1,1,1,0,0,-4,-2,-3,-2,0,2,4,2,0,1,3,3,-2,-9,-3,-1,-3,-1,-5,-3,-7,-1,-5,0,1,1,-1,2,0,3,5,3,7,7,4,2,3,2,1,-1,-5,-2,-2,-2,-2,-2,0,0,1,2,-1,1,0,0,0,0,0,0,-1,-1,0,0,-1,-1,0,-1,-1,0,5,-2,-5,0,-1,0,-2,3,2,1,0,0,-1,0,0,0,1,4,-1,-1,1,2,0,-2,-2,3,5,5,4,4,2,-1,-1,0,-2,0,-1,0,1,0,-2,0,4,1,1,0,0,2,0,0,0,-1,0,0,-2,0,-2,0,-2,-1,0,-1,-3,-2,0,0,-5,-5,-2,-1,-5,-4,-4,1,-1,-4,-5,0,5,1,0,-1,0,0,0,1,5,2,1,3,2,4,2,1,1,0,0,0,-1,-1,-2,-4,-4,-2,0,-1,0,0,0,-3,-3,0,2,6,-1,-6,0,0,5,5,6,6,5,3,6,3,-1,-4,-4,0,6,7,2,-1,1,-1,-2,-3,0,-4,-6,-2,0,1,-3,-3,0,2,1,5,8,7,5,-2,-3,-5,-2,0,4,5,5,5,1,-3,-6,-12,-12,-3,7,13,13,9,-4,-9,-12,-9,-4,5,9,5,3,2,0,-5,-9,-11,-7,0,4,8,5,2,-6,-12,-6,-2,1,0,1,0,0,-2,1,0,0,-3,-5,-2,0,4,3,3,1,-3,-4,1,8,13,8,-5,0,3,0,-1,-5,-4,-6,1,4,9,10,2,-4,-5,-10,-8,-6,-3,0,0,0,5,5,-4,-4,-6,-3,4,2,5,8,4,-1,-3,-2,-2,-2,-3,-4,1,9,11,6,0,-10,-15,-10,3,9,14,13,12,10,7,2,-7,-20,-18,-15,7,33,44,32,1,-35,-48,-45,-21,6,30,43,46,37,17,-12,-59,-101,-99,-44,47,134,146,101,2,-109,-151,-128,-62,12,72,103,125,102,44,-46,-135,-195,-159,-48,94,215,206,109,-11,-123,-160,-128,-80,-21,45,106,152,159,86,-52,-168,-221,-165,-21,103,177,166,81,8,-49,-87,-103,-106,-88,-15,93,166,181,106,-37,-149,-185,-138,-12,77,115,100,56,18,-4,-36,-80,-102,-94,-37,65,137,140,79,-24,-108,-125,-93,-29,33,53,58,54,46,31,-4,-65,-106,-96,-40,55,114,115,71,-8,-71,-83,-65,-23,4,20,36,51,55,36,0,-52,-81,-65,-19,33,73,64,32,-2,-28,-33,-24,-18,-8,3,14,33,53,45,14,-30,-59,-47,-19,22,51,49,23,0,-18,-25,-30,-35,-27,-15,5,33,41,19,-12,-48,-61,-36,-4,16,22,17,13,7,0,-4,-15,-28,-38,-19,22,43,50,30,-3,-26,-41,-31,-18,-6,8,25,40,48,42,9,-31,-61,-65,-31,8,36,55,53,32,7,-7,-26,-35,-41,-35,5,37,49,45,24,-15,-30,-41,-44,-23,0,16,32,41,41,21,-15,-42,-48,-38,-9,27,52,59,40,7,-20,-32,-44,-41,-13,11,37,51,39,15,-19,-50,-49,-33,-12,19,42,45,33,4,-29,-49,-50,-35,1,26,43,51,32,0,-29,-50,-60,-45,-15,19,45,52,36,4,-29,-51,-54,-38,-1,39,56,61,42,7,-30,-56,-63,-34,0,39,63,64,40,3,-32,-54,-54,-42,-7,34,57,58,28,-5,-25,-40,-31,-12,4,18,28,20,10,1,-18,-28,-21,-11,2,20,30,20,0,-27,-42,-30,-9,8,9,3,10,10,9,7,-4,-17,-21,-8,7,23,26,17,5,-5,-11,-11,0,3,5,5,4,5,2,-3,-10,-17,-17,-8,3,14,25,21,0,-16,-19,-12,-6,-3,1,14,15,15,14,2,-9,-22,-28,-15,2,20,28,14,-13,-24,-21,-8,0,11,9,-5,0,7,13,9,-10,-24,-25,-8,4,10,17,13,0,-8,-11,-4,2,8,14,8,3,-2,1,2,8,7,0,-2,-10,-6,2,9,7,4,0,-1,-7,-3,-2,1,0,9,17,11,6,3,3,0,0,-7,-20,-17,-13,1,14,17,11,5,0,-3,-6,-12,-18,-24,-17,6,16,23,13,-6,-16,-15,-10,-3,-3,-9,-6,0,17,27,16,-11,-33,-40,-26,4,27,32,7,-20,-20,2,31,34,-1,-44,-52,-19,31,52,34,-6,-20,-4,25,42,0,-52,-91,-75,0,71,126,117,41,-47,-121,-135,-49,43,89,49,-49,-50,67,239,269,-40,-422,-625,-385,321,835,823,160,-666,-915,-484,396,804,395,-426,-975,-387,656,1367,1012,-451,-1555,-1637,-397,1191,1689,989,-512,-1301,-858,218,1071,622,-427,-1199,-956,344,1395,1311,306,-982,-1255,-584,364,874,382,-315,-597,-151,610,807,292,-664,-1072,-635,265,1016,769,-1,-659,-672,43,605,583,-112,-774,-733,-63,839,996,389,-504,-1074,-652,155,753,727,49,-537,-537,-107,405,420,20,-427,-554,-139,364,614,410,-115,-464,-496,-194,166,293,215,29,-68,-37,24,34,-54,-130,-120,-19,87,139,110,26,-11,-26,-27,-72,-121,-110,-7,148,223,127,-54,-199,-203,-29,135,176,65,-105,-154,-56,130,196,87,-104,-254,-176,16,174,203,52,-100,-160,-86,50,110,74,-24,-79,-30,52,103,88,23,-40,-75,-46,-2,36,46,21,4,-20,-42,-47,-24,12,32,29,1,-35,-45,-2,35,63,35,-57,-109,-103,-32,65,81,20,-62,-81,-22,73,110,31,-111,-172,-122,29,172,209,130,-31,-124,-130,-77,-4,23,28,41,67,101,95,23,-76,-140,-133,-78,20,117,157,162,120,26,-96,-189,-201,-100,36,130,147,64,-37,-94,-90,-58,-65,-100,-114,-58,90,219,260,155,-31,-164,-206,-118,39,152,192,153,80,14,-69,-152,-202,-203,-113,22,172,239,212,121,-25,-152,-234,-222,-100,72,248,357,296,105,-135,-377,-441,-267,-16,227,424,458,362,165,-112,-340,-436,-412,-250,42,248,346,239,-67,-336,-513,-493,-278,-40,169,344,435,443,384,209,-40,-223,-280,-151,115,295,297,96,-207,-384,-421,-329,-206,-131,-98,-48,81,233,287,232,54,-41,8,170,365,400,301,120,-65,-138,-137,-140,-181,-188,-148,-68,10,-22,-118,-210,-248,-164,-37,66,122,162,207,254,246,127,-69,-206,-208,-70,121,201,164,27,-105,-169,-178,-157,-148,-153,-119,-1,147,233,227,110,-52,-120,-110,-24,78,130,151,131,67,-5,-82,-155,-155,-97,5,110,110,58,-34,-113,-117,-60,4,52,104,145,162,145,58,-105,-245,-273,-142,72,212,218,84,-125,-254,-274,-204,-100,-22,52,142,218,216,119,-53,-183,-172,-72,82,208,241,202,115,22,-67,-158,-244,-202,-38,101,178,159,49,-63,-138,-142,-99,-62,-31,29,125,203,233,164,-11,-156,-220,-168,-24,86,127,84,-7,-46,-58,-64,-97,-156,-180,-127,30,188,262,221,55,-89,-156,-97,39,117,88,18,-23,-1,32,35,-48,-212,-308,-254,-7,269,368,291,24,-189,-208,-101,63,113,44,-22,26,193,299,223,-95,-447,-566,-385,33,386,480,368,139,-34,-123,-178,-243,-282,-205,-14,238,428,361,124,-181,-466,-570,-507,-288,87,484,728,763,534,125,-224,-448,-482,-281,-40,192,379,387,237,-41,-444,-736,-791,-647,-253,199,504,640,600,400,83,-194,-371,-356,-64,271,532,612,401,78,-262,-539,-623,-588,-466,-257,0,215,333,316,122,-95,-255,-285,-114,134,401,604,581,404,127,-173,-349,-372,-280,-144,-60,-29,-7,35,81,43,-83,-265,-395,-284,-21,300,562,567,376,124,-101,-146,-97,-93,-184,-294,-271,-110,141,256,171,-48,-379,-557,-484,-191,212,450,515,506,480,386,221,-4,-248,-374,-353,-215,40,156,22,-231,-441,-567,-579,-537,-421,-94,382,760,978,942,595,221,-30,-84,45,113,52,-81,-137,-120,-246,-641,-1185,-1425,-1181,-370,588,1130,1080,733,518,507,515,340,7,-167,-20,376,541,234,-482,-1379,-1837,-1762,-1328,-587,153,679,1050,1264,1151,876,534,341,448,599,571,264,-139,-333,-430,-591,-949,-1337,-1620,-1607,-1078,-137,632,1036,1092,894,692,551,505,607,732,803,646,409,336,245,-90,-756,-1353,-1764,-1749,-1130,-308,467,660,-52,-827,-1243,-939,-5,898,1612,2099,2025,1566,980,253,-343,-589,-543,-16,604,630,10,-973,-2094,-2688,-2574,-2002,-878,93,512,538,544,730,1057,1427,1785,1921,1847,1520,1210,1074,894,311,-785,-2130,-3080,-3484,-3155,-2060,-941,-166,294,534,878,1370,1847,1623,855,181,86,980,2210,2712,2230,410,-1734,-2892,-2859,-2019,-1160,-846,-751,-806,-542,22,578,945,882,670,619,979,1476,1600,1202,251,-919,-1668,-1878,-1450,-747,-339,-132,-26,-42,-225,-157,96,588,1020,1479,1654,1328,555,-169,-627,-942,-1097,-1148,-815,-113,473,477,223,-429,-1100,-1433,-1167,-394,493,869,941,711,315,-159,-638,-846,-133,1037,2265,3185,2987,1949,435,-1213,-1768,-1484,-1107,-1237,-1821,-2030,-1720,-1328,-780,-554,-652,-949,-797,356,1759,2787,2945,2201,1392,593,47,209,908,1498,1818,1326,584,-305,-1604,-2889,-3764,-3535,-2797,-1963,-1494,-516,356,467,44,57,21,29,409,1491,2853,3788,3685,3008,1987,649,-442,-830,-404,229,19,-910,-2171,-3654,-4245,-3663,-2292,-624,98,4,-81,232,954,1524,1806,1461,938,1073,2160,3549,3938,3247,1881,165,-1370,-2311,-2880,-3035,-2956,-2620,-2041,-1218,-1080,-1718,-2120,-1664,-712,134,771,1974,3652,4785,4761,4013,2007,-602,-2352,-2977,-1906,-321,287,-238,-1393,-2461,-3217,-3475,-2872,-1157,308,1346,1917,2651,3590,4154,3451,1559,54,-895,-1740,-1875,-1242,-341,-549,-1921,-2463,-1815,-1140,-1220,-1192,-340,810,1334,1477,1978,2590,2020,465,-426,-432,-931,-1638,-1379,42,862,214,-147,267,363,-535,-891,-223,1071,1454,1221,1101,1006,-4,-1000,-1218,-253,556,640,1102,1566,1564,369,-453,-1012,-665,-444,-596,-749,-133,638,886,629,143,-490,-919,-1338,-1183,-296,534,485,2,-313,-587,-1065,-1532,-1172,10,1152,1830,1219,335,-560,-1491,-1817,-1431,-713,156,879,1657,2150,2212,1610,716,218,154,400,699,1081,1339,1078,95,-1181,-2293,-3029,-2757,-1978,-1179,-356,29,32,-269,-665,-718,-584,-377,-453,-467,-286,-568,-1292,-2315,-2905,-3577,-4287,-4676,-4527,-3515,-1367,945,2342,2224,1491,769,970,1761,3163,4723,5537,5656,5225,4360,3094,1679,24,-1452,-1460,-641,-97,491,1155,1749,2117,1959,1702,1651,1713,1582,1655,2262,2719,2576,1682,1072,716,128,-600,-1170,-1163,-1274,-1587,-1686,-1439,-833,-779,-1254,-1795,-1902,-1610,-1126,-358,507,1555,1851,1675,1745,1879,1721,1072,498,-37,-438,-773,-802,-342,135,54,-480,-1194,-1749,-2227,-2580,-2551,-2275,-2251,-2202,-2056,-1730,-1694,-1937,-2143,-2061,-1970,-2495,-3408,-4378,-4934,-5425,-5808,-5770,-5689,-5736,-5960,-6039,-5896,-5668,-5020,-3889,-2737,-1819,-932,179,1397,2622,3238,2518,1229,-276,-1481,-1373,236,2418,4801,7584,9834,11206,12153,12684,12688,12363,12012,11809,12086,12388,12163,10947,9004,7171,5388,4114,3822,3828,3604,2808,1682,728,-123,-1357,-2728,-3861,-4731,-5380,-5612,-5572,-5772,-6169,-6666,-7022,-7232,-7423,-7349,-6880,-6152,-5231,-4210,-3352,-2810,-2544,-2526,-2601,-2435,-1969,-1219,-568,-194,-244,-1207,-2933,-4408,-5218,-5180,-4394,-3450,-2504,-1576,-1111,-1090,-1228,-1265,-1001,-445,289,1179,1845,2016,1758,847,-581,-1998,-3341,-4716,-5782,-6532,-6885,-6879,-6923,-6945,-6710,-5983,-4658,-3082,-1475,-16,794,-86,-1686,-3111,-3873,-3497,-2257,-180,3202,6607,9026,11157,13289,14410,14641,15004,15756,16771,17351,17860,18051,17309,15989,14314,12235,10382,9011,7994,7021,5709,3874,2118,300,-1640,-3360,-4501,-5184,-5880,-6390,-6605,-6833,-7086,-7635,-8477,-9329,-10574,-11333,-11206,-10410,-9036,-7734,-6829,-6052,-5504,-5395,-5314,-5141,-4446,-3424,-2586,-2054,-2229,-3090,-3558,-3071,-1569,29,608,315,-382,-1077,-1210,-949,-452,91,348,374,313,433,519,512,342,31,-124,-124,36,32,-511,-1475,-2764,-4414,-5917,-6748,-7241,-7582,-7886,-7766,-6963,-5513,-4485,-4117,-3706,-3142,-3366,-4377,-5290,-4860,-2573,448,2768,4759,6154,6509,6895,8048,10544,12896,14380,15908,17876,19099,18974,17905,16624,15503,14633,14490,15136,16028,15990,15181,13406,10547,7189,3474,-489,-3491,-5097,-6209,-6866,-7356,-8208,-9453,-11265,-12892,-13873,-14361,-14076,-12942,-11393,-9814,-8048,-6280,-5462,-5483,-5639,-5734,-5426,-4794,-3559,-2274,-1819,-2347,-3124,-3876,-4006,-3573,-2621,-1381,-768,-754,-889,-665,-217,230,731,1760,2840,3446,3591,3542,3064,2127,1096,97,-120,-212,-400,-967,-1852,-3089,-4327,-5200,-5579,-5631,-5994,-6657,-7284,-7221,-6851,-6321,-6120,-6230,-6235,-5654,-4165,-2496,-1729,-2069,-3283,-4467,-4613,-3902,-2145,-268,1070,2201,3807,6066,8223,10688,13610,16435,18399,19966,21463,22322,22421,21915,21604,21203,20730,19818,18394,15653,11899,8503,5197,1498,-2270,-5213,-7614,-9522,-10738,-11439,-11937,-12204,-12231,-12169,-11921,-11241,-10346,-9495,-8324,-6707,-5275,-4639,-4501,-4680,-4955,-5223,-5449,-5671,-5739,-5761,-5885,-6004,-5646,-4534,-3851,-4102,-5025,-4002,-818,3002,5494,4753,3312,2137,1181,512,533,1063,1220,307,-342,-164,115,-668,-1968,-2925,-3106,-2455,-1505,-507,149,-720,-2195,-3642,-4684,-5608,-6513,-7069,-6933,-6441,-6233,-6288,-5965,-5157,-4188,-3363,-2589,-1845,-1884,-2967,-4931,-6999,-6923,-4709,-1471,1952,4210,5946,7893,10141,11648,12596,13920,15878,17951,19588,21474,23223,23938,23856,23877,23577,22197,19947,16814,12660,8186,4649,1385,-1860,-4944,-7579,-10057,-12431,-14084,-14953,-14686,-13506,-11819,-10726,-10087,-9292,-7851,-6345,-5315,-4564,-3928,-3412,-3108,-3104,-3676,-4811,-5830,-6754,-7774,-8461,-8128,-6774,-4989,-4442,-4823,-4994,-4156,-2394,-65,2483,4384,4533,3675,2806,2273,1753,971,184,-296,-457,-541,-555,-585,-1172,-2285,-3501,-3996,-3488,-2909,-2523,-2092,-1952,-2443,-3551,-4746,-5302,-5402,-5444,-5302,-4820,-4328,-3826,-3182,-2237,-1772,-1961,-3065,-4515,-5713,-6316,-5972,-4414,-1981,-242,825,1060,919,1479,3624,8026,13360,17622,21188,24203,25088,24525,23383,22662,23355,24644,25924,26016,23652,19672,14616,8402,2420,-2535,-7037,-10640,-12209,-12611,-13089,-13677,-14353,-14901,-15341,-15033,-13607,-11106,-8408,-5556,-2181,-128,376,-50,-1146,-2787,-4583,-6422,-7666,-7976,-7984,-8119,-8828,-10342,-11769,-11756,-8188,-1854,2311,3205,1547,339,705,1209,1207,1159,1498,1659,1457,1027,664,-457,-2511,-3974,-3727,-2340,-526,577,779,230,-1044,-2282,-2520,-2268,-2377,-3043,-3459,-3283,-2788,-2787,-3835,-5282,-6533,-7161,-6741,-5844,-4625,-3003,-1889,-1639,-1875,-2051,-2395,-3276,-4391,-4508,-2411,-115,1212,1806,2394,3608,5811,10087,16007,20893,24098,25826,26141,26470,26875,27248,26949,25203,22278,18013,12464,6911,2125,-3249,-9396,-13807,-15988,-16974,-17168,-16561,-15813,-14991,-14004,-12108,-9734,-6886,-3532,-861,864,1986,2635,2417,1363,-535,-3473,-6658,-8977,-10682,-11862,-12172,-11834,-10752,-8787,-6351,-5431,-5932,-6348,-4954,-1456,2183,5829,9514,11130,10334,7836,4665,1999,32,-1789,-3038,-3061,-2894,-3236,-3913,-4599,-5266,-5960,-6046,-4482,-2234,74,2132,3130,3040,2055,328,-1441,-2718,-4147,-5512,-5963,-5482,-4953,-5256,-6710,-8536,-9352,-8821,-6774,-4292,-2615,-1489,-173,1337,2528,3296,3059,2300,2191,3824,7719,13006,17602,21917,25110,25552,24760,24574,25697,27227,27433,26124,22836,18491,14307,9215,2144,-5519,-11332,-15339,-17674,-18000,-17726,-17478,-17006,-16037,-14417,-12382,-9661,-6028,-2456,196,2522,4604,5226,4270,1826,-2290,-6522,-9337,-11201,-12426,-13172,-13291,-12704,-10980,-8955,-7962,-8004,-8126,-6227,-2275,3201,9197,12417,12600,10779,7497,4491,2797,1752,472,-1057,-2246,-3097,-4309,-6266,-8132,-8860,-8646,-7267,-4482,-1600,995,2608,2485,1747,908,-22,-671,-1161,-2013,-3595,-4910,-5135,-4952,-5449,-6865,-7894,-8670,-9296,-9913,-9622,-8113,-4941,-685,3040,6153,8102,8118,8376,10303,13498,16771,18765,19832,21477,23670,25689,26870,26928,25772,23516,21440,18502,14475,9636,5571,1816,-2670,-6933,-10328,-12855,-15205,-16762,-17397,-17198,-15956,-13724,-11233,-8542,-5647,-3358,-1863,-765,-204,-535,-1155,-2134,-3668,-5649,-7877,-9688,-11428,-12868,-12876,-11841,-10343,-8972,-7860,-6714,-5056,-2601,463,3578,6515,9033,9788,9245,7995,6240,4820,3959,3103,1387,-716,-2387,-3805,-5441,-7145,-8210,-8631,-7972,-6270,-4331,-2578,-1125,-477,-334,-264,-453,-938,-1610,-2300,-2882,-3505,-3851,-4118,-4782,-5738,-6856,-7730,-8484,-8483,-6958,-4832,-2034,1257,4101,5392,5620,5607,7326,10717,15431,20499,24167,25802,26005,25106,24436,25098,26065,25716,22930,19563,16095,11913,7281,2951,-1696,-7178,-11567,-14225,-15356,-16079,-16680,-16867,-16272,-15109,-12999,-10292,-7925,-5535,-3171,-1287,-58,603,267,-1592,-4023,-6679,-9285,-11018,-11941,-12574,-12611,-11593,-10073,-8818,-8002,-8216,-8177,-6163,-1682,4266,8674,11250,12015,10825,9465,8127,7268,6635,5698,4008,1526,-1044,-3339,-5656,-8535,-10719,-11681,-11544,-9981,-7233,-4787,-2995,-1968,-1616,-1397,-1093,-926,-1320,-1835,-2149,-1819,-1248,-1271,-2208,-4252,-6292,-7388,-7014,-5358,-2501,231,1810,2518,2555,2483,3195,5354,9890,15469,19749,22622,24762,25824,26093,25574,23702,20631,17664,15011,12292,9123,5596,1460,-3506,-7750,-10589,-12844,-14556,-15170,-14979,-14042,-12443,-10428,-8626,-6656,-4337,-2253,-672,19,399,178,-646,-1676,-3139,-5283,-7925,-10178,-12211,-14271,-15426,-15307,-13734,-10340,-6367,-3657,-2028,-813,734,2881,5199,7030,7367,7203,7662,8709,9099,8176,5957,2466,-1099,-3314,-4229,-4281,-4063,-4192,-4517,-4890,-5154,-5436,-5657,-5813,-5879,-5221,-4020,-2447,-1422,-2208,-3816,-5490,-6640,-6479,-5369,-4075,-2867,-2387,-1961,-951,784,2727,4018,4807,4593,3506,2956,4097,7861,13162,17645,21201,24069,25218,25509,25374,25589,25111,23735,21410,18021,14053,8908,3892,-1469,-7231,-11739,-14357,-15963,-17037,-17492,-17498,-16812,-15076,-12434,-10044,-7427,-4366,-1310,824,2457,3656,3601,2360,-177,-4147,-7947,-10414,-12322,-14167,-15404,-15521,-14934,-13762,-12674,-11596,-9833,-6703,-2617,1592,5167,8445,11239,11980,10996,9006,6654,4860,3913,3208,2135,816,-538,-1756,-2983,-3903,-4597,-5114,-5138,-4504,-3674,-3193,-3153,-3673,-4504,-5618,-6730,-7249,-7033,-6821,-6659,-6334,-6031,-5822,-6196,-6168,-4935,-2295,1528,5075,7999,9668,10259,9857,10208,12035,14839,18000,20223,21825,23376,24688,25051,24960,24533,23354,20867,18187,15539,11946,7521,3322,-718,-5063,-9376,-12993,-16094,-18793,-20374,-20726,-19932,-17450,-14026,-11184,-8393,-5230,-2608,-1248,-525,-178,-88,-572,-1485,-2794,-4802,-6965,-8740,-9940,-10989,-12103,-13171,-13975,-13516,-11379,-8859,-6070,-2881,-94,1535,2445,3223,4339,5540,6741,7806,8309,8321,7531,5795,3763,1994,266,-1533,-2766,-3247,-3766,-4839,-6217,-7283,-8146,-8727,-8893,-8447,-7779,-7008,-6130,-5826,-6051,-6692,-7126,-6019,-3913,-1153,1533,2874,3285,3524,4492,6161,7900,9749,12570,16182,19450,22055,24167,25196,25807,26423,27053,27047,26190,24588,21287,16889,12633,8118,2685,-2810,-7603,-10844,-13149,-15012,-16443,-17415,-18043,-18068,-16940,-15138,-12536,-9174,-6036,-3948,-2352,-1107,-925,-1445,-2641,-4757,-6927,-8555,-9297,-9188,-8783,-8897,-10056,-11995,-12998,-12443,-10582,-7772,-5084,-3162,-1440,120,1063,1787,2389,3275,4340,5653,7071,8003,7860,6238,4342,2597,869,-514,-1319,-2203,-3516,-5117,-6198,-6738,-7092,-7542,-8200,-8343,-7748,-6468,-5271,-4886,-5108,-5753,-5417,-3376,240,3514,4383,3611,1983,826,1167,2861,7328,14171,19957,24050,25292,23074,18830,14878,11907,9887,10351,11726,13383,14087,12429,9391,5028,32,-3593,-5101,-5292,-4290,-2392,-1044,-716,-1877,-4279,-6433,-8160,-9711,-9759,-8771,-7213,-5381,-4827,-5247,-6481,-8989,-11379,-12777,-12921,-11453,-8520,-5486,-3006,-1786,-2481,-3813,-4870,-5781,-6524,-6618,-5771,-4647,-3098,-1662,-922,-329,143,1103,2743,4658,6601,7231,6785,5761,4189,2461,1023,-562,-2543,-4136,-5081,-5639,-6083,-6627,-7001,-7146,-6861,-5938,-4694,-3123,-1421,-13,852,1443,1852,1878,2094,2356,2832,2965,2953,3283,3493,3488,3144,3504,5626,9349,13273,16792,19840,21354,21764,22181,22761,22849,21619,19188,15124,10707,7000,3117,-1455,-5931,-9620,-11938,-13459,-14322,-14617,-14354,-13525,-11839,-9435,-7391,-5610,-3957,-2843,-2120,-1671,-1243,-1092,-1235,-1843,-3066,-4526,-5775,-7026,-8867,-11262,-13246,-14178,-13405,-10985,-8745,-7443,-6809,-6503,-5769,-4190,-1379,1770,4088,5812,7144,8143,8606,8480,7693,5984,4019,2247,583,-1298,-3110,-4591,-6174,-7624,-8256,-8143,-7357,-6213,-4801,-3576,-2474,-1548,-836,-128,668,1664,2407,2991,3401,3438,2853,1792,667,-319,-549,-122,663,2288,4679,7372,10576,14340,17669,20420,22457,24340,26006,26475,25439,22854,18520,13378,8968,4801,7,-4388,-7598,-10399,-13129,-15188,-16478,-17147,-17055,-15879,-13940,-11623,-8630,-5745,-3724,-1943,-363,394,900,917,614,-239,-1460,-2541,-4165,-6512,-8853,-10765,-11723,-11235,-10585,-10506,-10906,-11908,-12207,-11266,-9080,-4987,-842,2247,4773,6926,8378,8929,9248,9376,9140,8427,7263,5205,2128,-795,-3714,-6486,-8187,-9079,-9372,-9028,-8065,-6961,-5877,-4532,-3133,-1842,-429,1779,4491,6536,7358,6714,4714,2419,473,-763,-1578,-1833,-1780,-1631,-548,2322,6498,11476,17235,20945,22131,22293,22072,22663,23135,23002,21283,17499,13612,9274,4037,-1088,-4965,-8001,-10292,-11384,-11824,-11887,-12093,-12004,-11475,-10516,-8728,-6911,-5524,-4376,-3412,-2254,-1640,-2106,-3364,-5415,-7466,-8613,-8909,-8838,-8337,-7876,-7460,-6935,-6894,-7203,-7849,-8786,-9275,-9198,-8342,-6115,-3091,-586,1357,2635,3215,3842,4764,6542,8092,8726,8473,6764,4194,1739,-530,-2464,-3631,-4125,-4326,-4409,-4637,-5016,-5250,-5141,-4401,-2878,-1231,586,2266,3192,3385,3309,3210,2907,2481,1804,1111,345,-191,-575,-861,-633,135,1956,5196,9316,12941,16171,19824,22883,24590,25148,24018,21165,18218,15067,11655,8405,4707,1445,-2179,-6049,-9210,-11311,-12816,-13867,-14047,-13270,-11530,-9094,-6506,-5015,-4122,-3608,-3376,-3098,-2833,-2734,-2858,-3487,-4280,-5037,-5252,-5037,-5822,-8118,-11764,-14883,-17073,-17933,-17099,-15528,-13418,-10701,-7840,-4519,-1749,720,3354,5627,7686,9453,11325,12407,12209,10543,6933,2339,-1253,-3694,-5171,-5246,-4642,-4135,-3869,-4113,-4388,-4037,-2729,-178,2473,4980,7074,7616,7136,6331,5348,4600,3692,2599,890,-883,-2088,-2928,-3559,-3964,-3875,-2816,-327,4432,10276,14972,18743,21716,23077,23276,22900,21862,19863,17183,13792,9202,4736,1443,-1466,-4688,-7838,-10334,-12224,-13370,-13026,-11708,-10053,-8025,-6219,-5055,-4127,-3143,-2247,-1336,-566,15,16,-924,-2036,-3383,-3992,-4300,-5418,-7839,-12012,-16272,-18819,-19878,-19689,-18236,-16574,-14701,-12009,-8713,-5617,-2384,1104,4098,6034,7242,8249,8650,8466,7628,5475,2518,107,-1812,-3042,-3152,-2618,-1844,-880,-99,717,1684,3103,4762,5838,6519,6871,6698,6605,6530,6324,6151,5266,4040,2280,192,-776,-455,483,1300,770,-848,-2080,-1595,1994,6596,10738,14082,15277,15249,14989,14524,13682,12683,11162,9120,7315,5779,4279,2260,-610,-3509,-6577,-9502,-10347,-9197,-6557,-3179,-1401,-1562,-3097,-5520,-7190,-7723,-7286,-6120,-4666,-3208,-1521,223,712,-630,-3639,-8486,-13112,-15521,-16175,-14936,-12958,-11777,-11532,-12076,-12467,-11845,-10074,-6538,-2367,1204,3033,3477,2798,1295,58,-778,-1065,-833,-518,-247,42,552,1150,1837,2629,3363,4259,5459,7480,9517,10284,9920,7924,5703,4663,4473,5021,5209,4563,3450,1866,761,390,404,568,711,843,981,1065,896,1157,2248,4592,8841,13351,16618,18493,18302,15833,12157,8350,4222,1370,107,-442,-943,-1738,-3006,-4796,-6924,-8518,-8957,-8154,-6032,-3102,-834,592,1326,811,-199,-1371,-2220,-1616,-36,1626,2442,824,-2223,-6280,-10866,-14142,-15664,-16016,-15792,-15353,-14499,-13224,-11504,-9186,-6724,-4868,-3131,-1395,-208,353,306,-491,-1933,-3221,-4342,-5011,-4963,-4303,-2979,-1209,463,1466,2191,2868,3639,4507,5676,7048,8005,8318,8062,7392,6505,5800,5385,5225,5202,4961,4602,4211,3586,3133,3046,3326,3977,4611,4802,4462,3272,1594,266,-513,-294,959,2395,4184,5889,6986,7512,7508,7640,7621,7515,7698,7745,7589,7084,5795,3495,356,-2323,-4439,-6070,-6391,-6148,-5670,-5070,-4482,-3777,-3164,-2706,-1691,-411,551,1428,1270,-29,-1616,-4094,-6493,-8483,-9806,-10474,-11585,-12453,-12910,-13525,-13632,-13008,-11675,-9563,-6757,-4173,-2393,-1578,-1445,-1993,-2825,-3394,-4012,-4232,-3906,-3459,-2517,-1353,-189,715,1195,1656,2088,2913,4316,6223,8093,8951,9117,8602,7569,6768,6055,5634,5713,6257,6870,7931,8394,8019,7199,5038,3505,2611,2337,2643,2199,1576,269,-1539,-2978,-3959,-4468,-4532,-3511,-1984,682,3963,6722,8508,8686,8710,7989,7561,7535,7255,7376,6516,5310,3324,617,-1819,-3396,-4026,-4316,-3807,-3446,-3080,-2692,-2592,-2439,-2648,-2565,-2343,-2026,-1696,-1891,-2460,-3727,-5213,-7238,-9122,-10104,-10956,-11001,-10427,-9804,-9006,-8422,-8010,-7684,-7565,-7125,-6480,-6174,-5847,-5884,-6044,-5777,-5451,-4431,-2538,-545,1162,2434,3241,3743,3621,3705,4115,4623,5584,6196,6665,6422,5650,5260,5090,5902,6995,7877,8814,8844,8415,8007,7310,6766,6389,5969,5807,5135,3911,2664,966,-932,-2519,-3481,-3821,-3917,-3615,-3150,-2801,-2298,-1863,-1471,-529,759,2535,4164,5368,6893,7617,7897,7718,6833,5806,4821,3952,3258,2517,1712,776,-732,-2204,-3292,-4425,-5387,-5954,-5922,-5624,-5250,-4716,-4386,-4220,-4228,-4294,-4369,-4412,-4438,-4554,-4887,-5652,-7023,-8653,-9892,-10300,-10086,-9496,-8967,-8812,-8890,-8941,-8342,-7351,-5592,-3055,-622,1198,2553,3652,4315,4499,4141,3495,2929,2790,3334,4434,5490,5530,4727,4010,3360,4117,5814,7734,10265,11656,11800,11332,9970,8472,7159,5805,4788,3795,3080,2475,1085,-404,-1828,-3242,-3759,-3890,-3260,-2342,-2051,-1600,-1885,-2231,-2011,-2036,-1385,-629,340,1972,2905,3555,3853,3231,2790,2646,2634,3083,3057,2765,2092,706,-304,-1373,-2176,-3014,-3979,-4174,-4331,-4228,-3785,-3700,-3406,-3229,-3199,-2893,-2812,-2773,-2764,-3046,-3436,-4162,-5086,-5860,-6523,-6729,-6950,-7255,-7309,-7352,-6822,-6008,-5233,-3921,-2694,-1492,-166,1328,2712,3216,3331,3112,3016,3197,3323,3552,3506,3321,3283,3409,3848,4390,4872,5531,6500,7487,8523,9177,9069,8300,6989,5556,4406,3727,3272,2510,1311,57,-1105,-2169,-3519,-4911,-5506,-5713,-4853,-3305,-2304,-1497,-1385,-1418,-1064,-628,317,1071,1614,2303,3000,3220,2759,1720,-55,-1529,-2020,-1824,-1175,-445,-161,-149,-355,-1032,-1542,-1794,-1715,-962,-217,221,489,191,-375,-1096,-2082,-2936,-3392,-3452,-2928,-2447,-1774,-1516,-1742,-2204,-3300,-4092,-4683,-4812,-4040,-3131,-2532,-2130,-2017,-1633,-651,616,1954,2722,2780,2764,2065,1138,489,-253,29,542,920,1331,1356,2110,3225,4622,5612,4600,3617,3128,4260,6610,8134,8011,6691,4042,2296,1625,884,786,-304,-1606,-2484,-3964,-4724,-5295,-5558,-4641,-4129,-3480,-2685,-2337,-2125,-1731,-858,758,1127,1032,921,511,1064,904,1187,1328,404,7,-228,-168,-382,-393,-371,3,-489,-1187,-1450,-2249,-1995,-2136,-1224,-429,-466,-577,-796,-511,-83,-572,-68,39,81,431,519,989,515,-694,-1394,-2382,-2294,-2188,-927,789,899,748,-602,-936,-1617,-1521,-821,93,836,216,114,320,64,-984,-1660,-436,527,1902,2737,3497,3765,2259,2125,1879,1696,2849,3725,4534,5036,4349,4640,3962,2687,2424,773,1464,1042,603,627,-693,-2436,-4736,-5201,-5352,-6047,-4737,-4662,-3359,-2724,-1425,-507,-1266,-1194,-1464,214,914,672,713,775,-838,74,-637,345,-1216,-1571,-1472,-1588,-1608,-1434,-644,5,372,1029,940,1134,1151,1770,1931,1451,1544,1079,2055,-31,395,-1452,-1368,-1755,-1953,-2194,-2787,-2561,-719,-853,451,46,925,107,41,-1032,-35,1273,713,2045,1260,-38,160,-1034,-995,-256,-2067,-741,-272,976,1464,1536,2230,3033,1452,2874,3100,5045,4508,4939,4818,1692,1089,-95,-223,-577,-361,-829,591,-756,-127,-267,-2121,-2967,-2504,-3992,-2159,-1711,-2233,-389,224,-360,-591,-1172,-632,-1254,-1712,0,-336,-857,-835,-474,-554,-1498,-1096,-1966,-87,666,-100,1211,1420,1414,239,-566,-608,451,-681,1064,1271,1580,372,69,-767,-456,635,90,929,16,130,-1944,-808,-1817,-1183,-3156,584,-2225,141,-682,-147,-25,-2261,588,-2109,492,-352,189,-674,128,1174,244,1567,323,1227,2245,595,3432,1649,2370,923,2147,-546,1296,479,619,1320,257,2944,748,1934,33,2148,-32,974,2011,230,2248,-4,-387,307,-1485,-1468,-2415,-876,-2097,-1447,-626,-2640,-2021,-2402,-1781,-2293,86,-2502,28,-598,76,634,-75,-935,357,905,767,697,1982,1073,1659,165,1927,-1705,29,-651,-2226,271,-744,1001,-2675,1497,-1408,631,-727,-319,568,771,1148,553,1220,333,1107,-251,1184,232,-408,-314,-388,-2770,-1400,-2612,-2796,-3024,-1451,-1013,-2320,-872,-2235,623,-1874,142,-193,697,1820,1823,2555,1910,3231,2464,2444,1579,2497,2039,2376,1491,1549,582,1160,-268,-565,309,128,-414,1136,-245,1718,-1703,1142,60,728,-165,-535,1659,-765,1664,-1286,759,-2895,-1011,-3265,-828,-2485,-1242,-1847,-1815,-814,-4782,-985,-2122,-621,-1406,751,-288,2521,-935,2056,-912,1313,-1697,1394,107,2084,375,1253,789,501,668,654,617,1481,2463,-518,1755,-395,645,-2891,309,-1039,1521,-849,1500,-903,911,-2304,851,-2737,-787,16,-1871,-939,-2393,1131,-3011,-1038,-3512,-2681,-3972,-1109,-2358,1410,-142,1348,760,1655,-559,867,55,2489,1295,3665,1840,2869,3717,770,1905,25,1977,575,1846,607,1962,1248,1490,-203,2527,-390,624,498,1844,1248,577,881,-698,129,-2124,-1002,-1977,-2377,-1476,-2272,-832,-3058,-2046,-2303,-2179,-3150,-1600,-871,-1324,264,-1129,875,-487,65,245,-81,624,-104,2151,-212,1832,1479,-175,-579,25,1750,177,1392,1908,1493,1717,92,838,675,-415,1268,1271,1038,766,266,4,-1602,-400,-2622,-1208,-2308,251,-2176,-1785,-1548,-1658,-2576,-2004,-1105,-3244,473,-220,1081,400,372,1695,-860,1055,-444,684,-526,4021,1311,1142,1385,2642,47,1378,62,1095,2589,2633,2731,3103,3600,1981,599,2265,761,-203,126,-129,-227,-2283,-871,-3259,-811,-2734,-362,-2085,1120,-1432,472,-1061,-371,-1467,6,-651,-1563,758,-998,-524,-3868,-619,-3740,-2111,-4422,-1017,-2910,-1692,-419,207,-224,-98,2943,1900,2452,3865,4502,1307,3437,3460,3116,-643,2747,1079,1396,-1289,889,-1512,-1072,-1013,-1886,-3387,-518,-3162,-904,-1993,425,-1173,-261,-751,-650,-1268,-417,-1265,-855,423,-1320,555,-2099,-32,-3237,-504,-170,64,-1863,1180,797,-358,567,1865,818,634,3544,2305,1908,3382,2629,2356,2532,1290,720,2053,777,1983,-1214,1088,338,-1432,2082,-2196,-631,-814,723,-1491,466,-1115,-801,-1982,-244,-1599,-1756,143,-2082,-868,-1014,-2723,-519,-2507,-2454,-1543,-2058,-1228,-1308,941,-673,-684,-1944,3496,-200,-145,1671,3141,2399,1742,3369,2100,2559,1643,1159,2692,2169,853,1796,1349,745,-992,-1135,-381,-2831,-1176,-1390,-938,-2999,-632,-3242,-544,-1869,-1011,-1192,-577,931,-697,551,-481,1012,-1299,-191,-982,-2566,-1157,-453,678,-2460,22,978,-702,154,111,2118,1156,1486,1887,2514,2843,359,2653,1252,2538,1580,959,1251,127,742,-917,871,-1076,150,-1521,485,-832,-1654,1612,-1316,-460,-1455,-884,-1256,-1388,-1608,-1411,-1685,-1643,-2493,-761,-1082,-1240,-1151,1752,-42,665,314,1018,615,-348,1057,-1831,969,968,1877,844,68,2738,-1167,2207,891,1135,2404,1678,1646,361,3177,-1598,-121,989,-1628,-513,-1072,-389,-2914,822,-3229,-1009,-2346,-602,-2461,-491,-2205,-28,-1050,-1232,-712,-396,-1082,-588,-489,-906,211,-480,808,-286,1526,-3388,1823,-488,-385,3135,-311,1986,1697,-244,794,1206,2077,-1848,1475,1340,1331,2106,-242,2201,324,1534,272,1494,713,1460,-297,939,-275,-551,-1056,-1150,-1785,827,-1715,-2653,-658,-1411,-2358,-2415,-91,-3171,-540,-1176,155,375,-668,1381,862,-311,-940,2841,727,766,936,2237,760,2048,9,1845,114,2735,-505,2717,-169,756,602,196,-1739,-935,-829,-343,-1412,-1282,1017,-835,-600,-1201,-40,-1484,-514,-284,-1867,-924,318,-1042,-3308,-2205,400,-1821,-1705,-1860,-100,1072,-4096,2042,671,842,-1012,1908,1310,1173,343,2130,2288,1569,-430,2282,-352,82,1328,801,-426,586,43,984,-406,313,1969,-717,1479,1713,1773,-2228,2407,-792,-503,-783,-242,-978,-1226,-382,-1397,-1245,-850,-2008,-2280,-801,-2477,1047,-2923,1596,-935,563,-658,256,905,299,596,1302,1828,1103,916,1329,679,465,1426,1263,-589,-591,4252,-1994,-326,-1093,3199,-2889,309,221,-867,-542,131,-594,9,-1331,-422,-1647,181,-1560,-1207,271,-1031,-793,-1877,327,-1003,-325,-1003,220,-23,1573,-200,358,-645,2570,-594,364,-790,3460,-1240,139,177,3505,-865,1038,204,2677,1327,-422,1414,3864,1141,214,1990,86,665,-268,94,1934,-609,-936,377,-343,-1786,-158,-691,-1946,-533,-1166,-136,-1043,-2449,-343,570,-1135,-2453,604,282,-452,-2449,1645,-1281,-527,-1839,769,-361,1446,-2893,3728,-628,1949,-1359,1300,1837,-448,1693,475,1637,141,1403,-509,782,-558,28,-373,-156,-441,461,-573,-526,-1235,-404,-592,-1093,-708,-409,2128,-2535,928,-1172,-122,-1511,324,-605,627,-233,-979,-722,-501,-838,-487,-769,2192,-160,-31,1319,-988,1023,932,1232,-2014,3391,269,2163,-775,1784,1736,196,3367,-85,1113,1147,-131,1089,-348,-86,599,-3339,1237,-1706,-64,-2555,427,-1720,251,-3703,129,-2312,-314,-2409,-534,12,-703,1260,-1375,1202,-2409,759,-1158,-14,-299,335,1383,324,57,908,-512,497,793,-1398,2496,925,1581,398,1980,-36,206,414,-548,1691,-524,1179,741,-992,291,-1068,980,-1703,766,-1295,1665,-2225,170,-1894,428,-1399,-1935,67,-1421,388,-1468,-455,-342,-1002,-1631,27,-488,-868,882,-1767,1188,2041,-90,170,653,2000,380,2249,1394,2054,1814,1108,1294,1432,-62,1342,-122,1127,648,537,874,320,402,-518,-192,-798,528,-1672,1139,-45,-803,616,-2766,-698,-2556,-619,-2016,-1537,361,-1820,369,-3106,331,-1663,-769,-1472,505,1240,190,715,2974,582,-407,162,2556,680,806,2566,-821,2380,-410,1139,-323,473,301,-936,2698,-1302,804,-450,733,-473,-748,157,-1030,-1008,836,774,216,-472,361,-318,-1121,-718,-297,-684,-631,-2798,401,-299,-1494,-2486,-107,-864,-597,-654,889,418,-804,496,-148,900,-427,2848,24,2047,630,958,1695,772,509,2653,1472,-546,305,224,197,-1136,1705,-400,710,327,-1361,973,-1727,28,-399,299,254,-777,-1148,-1300,120,-1122,-1067,-1340,-1656,-2007,-1294,-1819,-470,-620,-81,704,-32,127,98,922,-473,2487,411,2125,1937,1168,173,1238,-213,328,223,920,521,780,-209,-1246,1869,-1291,-711,896,-288,234,705,1241,348,-74,-182,-2148,155,-1228,-2187,-1757,3356,-2456,38,-780,-1414,-1638,-855,-520,-2338,-149,663,143,1097,2277,128,-139,-1206,1082,929,1346,-148,1940,879,193,376,716,-191,479,1876,1566,427,1050,1079,-365,-783,-463,1238,130,1195,773,1059,-136,-1452,1389,-1052,-1271,-400,-913,272,-1120,43,-1198,-2985,-3118,-1976,-1303,-2871,-618,-550,-589,-35,1193,1444,218,633,602,1906,1590,904,1451,-255,1025,289,61,-476,-196,550,-577,635,-331,-372,373,307,-21,154,1543,987,2353,1558,330,1395,-973,-1355,-1712,-1028,-154,-1048,-640,-156,-1538,-278,-2202,-1751,-1305,-2462,-302,-431,487,826,347,1080,844,517,661,238,-254,-203,652,139,1525,816,-79,546,504,582,-340,720,865,387,1013,955,2415,-164,971,1178,605,325,851,320,1288,-301,-705,-596,-2798,-1180,-3182,-2107,-1311,-1338,738,13,-520,-472,-1332,-1259,-1942,-536,-936,-622,1383,301,1507,1641,2070,1463,-276,-243,-641,648,-255,2373,2883,2285,2245,1534,-198,-1068,-2131,-2076,-780,-449,1283,1093,2116,1418,339,141,-1841,-1978,-2783,-2247,-1141,-283,359,823,1191,55,-106,-1496,-2436,-2462,-2865,-1684,119,1151,1903,2147,1828,1176,129,48,-753,-552,-681,364,342,1025,528,841,438,-214,-310,-574,-167,-738,331,168,861,1215,1625,1772,1302,1494,593,595,-475,-697,-1348,-969,-967,-327,-636,-203,-633,-1052,-1045,-1616,-1054,-1961,-1444,-1139,-853,494,331,1584,1032,974,1398,-21,267,-156,-450,359,-95,872,1312,1704,1853,1174,1094,554,-157,12,-200,-138,-295,435,633,973,519,316,287,-690,-995,-1188,-1094,-1064,-1169,-407,-523,-443,-353,-764,-959,-944,-516,-616,-379,-278,-725,-20,-780,-356,25,-327,322,-22,207,-115,135,371,-118,1140,251,684,-71,-1060,-238,281,1269,2288,2199,2342,1491,848,398,-223,-634,-116,-604,-593,-449,-1180,-835,-1116,-889,-569,-701,-598,-751,-472,-1055,-827,-402,-836,-215,-12,162,305,364,605,-83,330,-531,201,355,390,985,825,1271,1217,927,1089,1087,947,905,623,446,83,441,288,309,262,379,-235,4,-273,-244,-17,-172,-376,-488,-447,-793,-492,-892,-142,-786,-456,-936,-752,-579,-680,-324,-612,-407,-341,-223,-1025,-401,-500,-508,-80,-257,94,130,257,199,553,461,744,776,836,1013,1032,935,804,1084,743,1131,724,555,269,-77,107,-393,-195,-947,-452,-727,-769,-732,-949,-861,-875,-521,-726,-652,-780,-54,-584,-363,-20,-179,-173,-353,-226,-624,14,-198,233,213,486,540,565,497,231,253,229,478,745,541,969,890,527,660,354,278,523,81,136,391,365,257,189,304,-206,-187,-264,-649,-719,-297,-513,-464,-516,-574,-598,-712,-391,-663,-290,-385,-303,-220,-641,-309,-365,-434,-116,18,92,-111,415,219,23,611,427,806,686,1008,560,681,699,333,431,580,365,632,800,348,771,129,106,-413,-314,-803,-453,-121,-26,-283,-120,10,-193,-109,-708,-540,-1459,-1328,-1790,-1375,-1649,-782,-581,236,422,841,646,555,236,221,180,364,615,531,868,633,751,223,122,-365,-162,-801,-57,-197,344,139,666,532,249,658,311,383,479,472,325,418,209,116,-323,-371,-478,-608,-822,-720,-518,-496,-615,-212,-534,-290,-645,-318,-150,-215,-251,-43,-144,-37,86,81,621,241,964,197,399,433,-140,665,-220,582,62,516,384,347,480,174,351,-84,39,170,-99,205,-78,137,225,24,-38,-200,-165,-217,-667,-36,-739,-454,-931,-401,-762,-377,-608,-125,-158,-68,169,-44,218,-119,439,82,701,115,655,108,632,193,308,128,-127,265,-202,282,-33,88,145,106,98,-127,81,-101,-118,113,-133,453,27,406,255,56,273,-380,175,-447,-338,-293,-561,-310,-672,-287,-505,-381,-113,-541,190,-385,118,-115,-32,1,280,-167,577,261,730,311,494,363,305,28,50,-246,223,-236,253,79,434,103,211,276,197,-79,143,-181,-29,-37,-209,-9,-57,-84,-286,-53,-611,-230,-1206,-402,-476,-320,-73,-176,-22,-195,-87,-291,-130,278,-139,756,268,683,154,221,320,-289,467,-154,449,-46,466,293,370,76,509,-150,350,-475,297,-371,71,-101,-195,290,-531,39,-609,-5,-295,-329,-88,-723,-17,-565,67,-415,-68,-96,131,121,102,97,95,183,1,257,-164,537,-215,428,-89,77,46,-43,-20,16,161,250,428,517,512,295,307,39,185,-121,84,36,193,50,-40,-104,-246,-226,-418,-320,-386,-266,-394,3,-422,-192,-155,-132,79,-10,132,292,240,335,244,108,124,-98,43,-146,91,-151,-197,-89,-343,-7,-487,44,-213,117,102,158,280,193,229,261,351,259,376,396,417,273,178,-20,-154,-369,-398,-390,-441,-528,-363,-466,-166,-432,9,-159,24,-100,17,-210,147,-288,282,27,290,116,247,316,-91,166,-498,161,-454,50,-403,-192,-6,-98,473,57,498,138,614,193,463,32,531,224,403,85,61,168,-106,-94,-247,-180,-204,-45,-223,-146,-158,-304,-243,-328,-65,-152,-44,275,95,284,48,389,-99,180,-293,79,-108,-81,-81,-49,-10,-145,86,-172,129,35,121,-11,59,78,-1,41,126,115,402,-35,251,-23,-48,-277,-259,-356,-170,-360,27,-177,82,-248,-80,-215,-401,-77,-339,62,-111,169,56,62,-32,15,-162,-49,-112,-7,103,-37,81,5,216,-95,271,25,408,181,294,176,187,-12,-57,-112,-253,178,1,284,137,168,130,-78,-26,-110,-190,62,-103,236,313,176,507,-106,257,-313,109,-213,-127,-5,-225,104,-216,-51,-90,-195,-49,-144,151,4,-15,63,28,52,-75,146,8,143,70,12,-20,-39,-248,43,-238,190,-160,212,-149,87,-22,-268,-87,-276,144,57,362,285,339,174,-56,-8,-108,-324,-123,-163,-10,-254,40,-146,56,30,83,-13,-84,-223,-180,-266,-176,-85,-127,182,-32,323,114,160,40,-48,-79,-174,-101,-167,48,72,209,153,72,-45,-26,-204,-62,-206,-29,45,62,134,45,67,-41,1,-75,-26,73,-3,183,53,147,23,56,29,-84,82,-78,71,-153,-56,-70,-80,54,31,97,64,81,62,88,-11,60,2,82,18,201,116,316,126,4,138,-283,133,-253,103,-55,82,119,-11,147,-68,228,-18,95,62,76,47,27,-129,5,-215,-24,-116,54,-146,-80,-80,-257,-204,-303,-226,-209,-189,82,-46,139,-121,-44,-230,-234,7,-3,300,201,365,187,59,-132,-232,-233,-226,-53,106,230,344,296,101,-30,-293,-257,-381,-189,-76,147,258,164,291,-5,33,-153,-199,-88,-131,83,104,262,281,196,172,-106,-46,-196,-127,-54,17,123,174,163,140,-99,74,-314,-51,-269,-60,-13,116,282,133,298,177,180,104,-75,-83,-163,-217,-60,-20,171,107,145,11,-26,-136,-202,-196,-112,-57,164,154,239,209,23,38,-283,-101,-265,-115,-140,-121,58,-83,58,-143,-45,-181,-109,-122,-27,95,111,239,226,208,227,44,103,-24,-32,51,-143,79,-119,67,-135,-104,-154,-289,-131,-204,-58,6,-34,83,33,104,-4,98,14,81,119,21,116,-21,10,-90,-73,-135,-76,-78,-81,-39,-82,-38,-96,-32,-42,-7,66,83,132,127,89,128,13,197,2,221,44,234,205,215,126,-10,29,-122,-2,-149,73,-23,88,2,104,12,-16,-15,-30,-40,-47,-79,-25,-141,-22,-137,-65,-113,-64,-108,-134,-118,-166,-136,-104,-152,10,-48,67,155,116,170,-13,43,-105,31,64,101,242,166,225,61,23,-184,-151,-277,-271,-263,-252,-84,-68,99,42,125,67,96,139,128,144,114,135,59,86,86,161,187,138,68,-55,-147,-280,-329,-245,-258,-115,-26,48,52,-43,-62,-199,-52,-66,192,367,415,513,242,101,-178,-227,-186,-117,66,22,-119,-514,-713,-678,-226,1057,2554,4076,4963,4591,3188,625,-2991,-6413,-8240,-9245,-8516,-6079,-3065,111,3547,6217,7178,7068,5420,2936,-135,-2378,-3897,-4448,-3639,-1876,183,2595,4261,4779,4442,3366,2098,1258,1095,1197,1468,1605,1081,-145,-2020,-4113,-5794,-7358,-8062,-7659,-6928,-5175,-3266,-962,1295,3429,5777,7332,8481,8606,7842,6279,3831,834,-2210,-4173,-5768,-6319,-5823,-4463,-2998,-838,1442,2603,3235,3330,2375,1362,-369,-1534,-2311,-2448,-1707,-323,2062,2632,4705,5453,4541,3337,1409,-1075,-4029,-5929,-6145,-6359,-4593,-2688,-547,913,2085,2910,2162,1443,-276,-2250,-3439,-4335,-4175,-3193,-1186,1292,3694,6129,7233,7125,5709,3782,2250,-295,-1561,-2195,-2160,-1567,-464,697,1159,1775,1577,1058,615,-831,-2160,-3434,-4397,-4917,-4795,-3770,-2816,-1700,-465,814,1458,1228,1888,1575,1034,1172,803,627,697,1282,1481,1980,2609,2533,2774,2398,1553,856,-102,-1126,-1880,-2202,-2172,-2196,-1662,-1219,-840,-472,-327,-23,-524,-772,-965,-1174,-1020,-923,-206,457,855,1438,1550,1432,907,768,183,-277,-411,-556,-501,-411,-125,67,336,492,826,841,769,502,272,-68,-301,-427,-300,-359,-251,-235,-116,-212,-253,-243,-369,-318,-316,-327,-433,-585,-662,-727,-740,-793,-657,-327,60,397,612,1207,1315,1344,1285,1087,716,382,279,236,256,408,508,671,601,641,494,252,-84,-355,-800,-1221,-1438,-1494,-1430,-1085,-779,-319,-57,236,240,319,248,21,-218,-523,-594,-731,-748,-492,-247,34,512,975,1170,1468,1636,1465,1203,924,661,121,-112,-272,-394,-380,-332,-94,-84,-59,-174,-563,-793,-1043,-1130,-1120,-896,-551,-346,106,169,323,268,172,136,-295,-381,-651,-599,-505,-269,44,388,818,1115,1186,1221,916,505,243,5,-3,298,1185,1670,2569,2965,2938,2452,1358,-482,-2241,-3567,-4789,-5361,-4800,-4151,-2914,-1421,-229,411,657,887,870,487,443,490,773,1039,1266,1610,1603,1707,1485,1281,688,270,-218,-590,-786,-749,-620,-250,-162,-41,19,-69,-119,-286,-354,-293,-398,-539,-527,-624,-745,-666,-534,-231,111,762,1197,1563,1776,1708,1499,1136,756,344,143,239,376,774,941,1022,915,652,319,-370,-1054,-1836,-2119,-2366,-2074,-1347,-684,98,752,979,928,557,75,-303,-458,-614,-345,8,514,904,1171,1313,1271,1098,708,130,-519,-925,-1398,-1680,-1685,-1414,-1049,-495,158,578,680,565,222,-112,-421,-727,-674,-432,-82,244,575,644,592,372,52,-222,-466,-671,-794,-884,-985,-1070,-1070,-935,-689,-317,206,688,1039,1116,848,466,242,62,-49,136,394,672,1044,1436,1680,1641,1465,1042,596,54,-569,-1172,-1652,-1860,-1836,-1374,-879,-393,102,537,781,668,316,-122,-579,-863,-996,-804,-540,-328,-98,45,203,320,495,632,668,618,721,766,852,907,916,946,903,796,522,-99,-699,-1269,-1472,-1505,-1201,-886,-435,92,566,953,1112,1111,1011,915,575,63,-551,-961,-1332,-1372,-1302,-964,-545,-228,44,81,-24,-275,-621,-818,-982,-945,-737,-462,-207,-136,120,281,309,295,292,501,618,837,1090,1390,1493,1447,1487,1355,1239,942,547,106,-183,-505,-826,-1076,-1241,-1360,-1280,-1072,-760,-502,-37,355,642,916,1155,1363,1141,1020,768,573,496,420,313,168,75,-7,-160,-200,-203,-33,245,485,558,509,168,-384,-1017,-1487,-1812,-1921,-1906,-1729,-1536,-1264,-1088,-948,-937,-818,-606,-316,62,670,1542,2253,2821,3265,3377,3235,2690,1764,607,-411,-1345,-2102,-2405,-2406,-2114,-1610,-971,-508,-210,6,-21,-155,-180,-363,-518,-697,-773,-708,-569,-345,-205,-51,150,283,310,150,-84,-269,-477,-633,-724,-652,-450,-99,393,623,749,633,445,108,-160,-278,-346,-243,-162,-31,48,179,398,602,730,829,812,747,634,516,558,753,1051,1484,1891,2119,2142,2008,1644,1247,730,210,-187,-337,-413,-266,-83,107,262,383,392,299,176,-180,-490,-702,-868,-967,-938,-851,-749,-685,-750,-905,-1183,-1626,-2009,-2093,-2109,-1952,-1459,-818,-137,433,1124,1673,1966,2074,1987,1602,1202,717,275,-151,-457,-417,-134,219,493,680,609,438,99,-278,-786,-1269,-1594,-1818,-2036,-2179,-2149,-2099,-1923,-1686,-1462,-1319,-1115,-949,-785,-741,-749,-845,-982,-1045,-1203,-1309,-1390,-1402,-1429,-1496,-1578,-1664,-1721,-1613,-1407,-1158,-825,-350,180,553,982,1401,1781,2052,2376,2692,2847,2938,2877,2862,2799,2754,2658,2488,2479,2624,2848,3236,3720,4291,4826,5100,5295,5265,5049,4697,4093,3389,2786,2144,1551,1054,776,561,342,219,52,-194,-670,-1236,-1794,-2379,-2955,-3512,-3727,-3839,-3708,-3300,-2982,-2533,-2009,-1520,-1170,-978,-897,-1016,-1237,-1457,-1787,-2100,-2164,-2085,-1913,-1658,-1612,-1632,-1825,-2226,-2729,-3226,-3656,-3995,-4132,-4076,-3913,-3640,-3308,-3021,-2882,-2758,-2733,-2718,-2763,-2819,-2846,-2796,-2656,-2569,-2390,-2288,-2218,-2123,-2075,-1912,-1710,-1386,-872,-398,194,849,1479,2048,2505,2949,3462,4062,4472,4713,4873,4778,4587,4200,3682,3131,2751,2478,2460,2744,3220,3845,4734,5674,6431,7198,7936,8526,8823,9027,9140,9231,9215,9252,9231,9031,8780,8364,7789,6893,5694,4521,3082,1226,-647,-2223,-3801,-5679,-7331,-8608,-9782,-10922,-11885,-12463,-12852,-13077,-12933,-12655,-12266,-11557,-10735,-10008,-9093,-7913,-6497,-5173,-3784,-2030,-266,1146,2463,3642,4469,4890,5006,5006,4903,4838,4776,4651,4518,4143,3659,3067,2108,977,-61,-1158,-2451,-3630,-4475,-5176,-5860,-6434,-6768,-7004,-7061,-6998,-6858,-6538,-5954,-5192,-4454,-3648,-2536,-1514,-679,49,809,1389,1768,1988,2046,1879,1633,1356,996,747,692,664,862,1136,1537,1936,2274,2650,2847,2969,3007,3030,3094,3236,3500,3968,4595,5291,6075,7224,8586,9851,11194,12846,14290,15384,16153,16738,16751,16329,15458,13830,11568,9325,6885,3775,546,-2048,-4466,-7051,-9255,-10844,-12174,-13538,-14614,-15526,-16149,-16625,-16908,-16857,-16592,-15978,-14822,-13179,-11523,-9654,-7290,-4819,-2818,-927,1157,2890,4160,5105,6143,6923,7465,7850,8048,7978,7719,7189,6297,5098,3649,2045,344,-1367,-2670,-3781,-4803,-5562,-5982,-6198,-6169,-6020,-5832,-5658,-5414,-5198,-4977,-4763,-4417,-3976,-3477,-2870,-1997,-999,-158,579,1188,1570,1601,1366,851,118,-593,-1293,-2074,-2671,-3051,-3252,-3345,-3264,-3121,-2857,-2486,-1925,-1269,-657,51,939,1925,2737,3509,4502,5434,6361,7333,8660,10232,11633,13160,15051,16832,18177,19192,19992,20195,19878,19021,17429,15225,13017,10594,7519,4241,1498,-1178,-4288,-7218,-9521,-11682,-13992,-15938,-17558,-18567,-19226,-19607,-19487,-18933,-18068,-16604,-14705,-12859,-10878,-8305,-5806,-3739,-1773,408,2326,3817,5188,6623,7835,8760,9413,9887,9987,9763,9130,7938,6264,4645,2882,616,-1600,-3356,-4936,-6477,-7570,-8163,-8430,-8412,-8012,-7410,-6709,-5979,-5062,-4085,-3287,-2525,-1643,-800,-144,430,1040,1503,1721,1837,1742,1512,1133,670,-38,-785,-1399,-2048,-2721,-3375,-3902,-4359,-4820,-5063,-5048,-4937,-4577,-4053,-3371,-2615,-1616,-635,164,846,1599,2400,3397,4436,5636,7386,9298,11003,12885,15168,17338,18874,20082,21041,21311,21127,20562,19399,17603,15770,13654,10948,7956,5343,2663,-705,-4116,-6915,-9563,-12504,-15053,-16876,-18392,-19686,-20338,-20394,-20035,-19121,-17727,-16003,-14324,-12523,-10264,-7992,-6076,-4217,-2011,228,2127,3870,5847,7532,8694,9561,10187,10355,10114,9467,8272,6745,5287,3834,2000,173,-1343,-2743,-4267,-5623,-6551,-7245,-7944,-8334,-8380,-8118,-7390,-6314,-5195,-3999,-2566,-1205,-49,769,1330,1753,1818,1679,1425,1072,672,260,-162,-675,-1205,-1661,-2080,-2580,-3166,-3753,-4369,-5032,-5526,-5769,-5894,-5776,-5387,-4779,-3966,-2789,-1506,-447,573,1648,2656,3383,4219,5178,6299,7471,8691,10500,12432,14556,16436,18147,20062,21458,22259,22486,22090,20856,19225,17070,13964,10395,7275,4034,223,-3395,-6269,-8878,-11751,-14254,-16139,-17744,-19200,-20143,-20493,-20416,-19774,-18513,-17050,-15199,-12587,-9793,-7477,-5201,-2622,-334,1388,2840,4374,5649,6727,7486,8083,8608,8803,8657,8248,7371,6012,4612,2971,943,-1120,-2788,-4301,-5912,-7138,-7857,-8262,-8372,-8034,-7461,-6607,-5391,-3942,-2595,-1300,120,1386,2174,2755,3130,3151,2973,2563,1840,904,-220,-1145,-2095,-3187,-4159,-4830,-5272,-5599,-5778,-5784,-5821,-5879,-6025,-6078,-6102,-5944,-5561,-5046,-4276,-3037,-1538,-264,1093,2627,3901,4950,5932,7143,8637,10020,11543,13595,15847,17552,19248,20989,22035,22370,22189,21211,19659,17626,15413,12828,9613,6126,2959,180,-3332,-6771,-9297,-11717,-14271,-16179,-17221,-18119,-18612,-18410,-17964,-16885,-15217,-13338,-11404,-9346,-7002,-4604,-2562,-803,1090,2684,3719,4560,5368,5762,5788,5806,5431,4655,3883,2836,1370,-203,-1912,-3360,-4499,-5575,-6240,-6527,-6499,-6206,-5709,-5082,-4487,-3542,-2442,-1483,-368,1227,2970,4367,5598,6524,6771,6440,5664,4231,2519,857,-961,-3046,-4788,-5952,-6804,-7654,-8422,-8892,-9238,-9397,-9081,-8508,-7945,-7274,-6615,-5668,-4603,-3438,-2078,-862,167,1094,2360,3748,4653,5372,5721,5726,6138,6946,8367,10230,11898,13519,15480,17247,18403,19451,19936,19338,18482,17367,16089,14976,13545,11369,8532,5255,2311,-1056,-4785,-8429,-11559,-13876,-16059,-17015,-16966,-16587,-16009,-15182,-14214,-13381,-11878,-10038,-8535,-6831,-4873,-2729,-636,1322,3164,4221,4598,4465,4073,3571,3083,2535,1700,628,-209,-789,-1507,-2418,-3612,-4728,-5592,-6010,-5696,-5051,-4142,-3243,-2464,-1748,-832,311,1249,1860,2284,2923,3874,4851,5790,6253,5648,4408,2729,656,-1333,-2913,-4457,-6099,-7247,-7730,-7729,-7399,-7153,-7257,-7560,-7837,-7587,-6926,-6053,-5046,-4182,-3388,-2798,-2196,-1458,-856,-567,-253,395,1525,2804,3787,4623,5145,5449,5935,6873,8155,9413,10956,12721,14878,17043,18965,20583,21129,20849,20138,19169,17684,15999,14150,11072,7493,4600,1502,-2111,-5778,-9153,-12201,-14993,-16894,-17837,-17892,-17717,-17105,-15955,-14612,-12912,-10344,-7815,-6004,-3962,-1587,639,2435,3663,4556,4881,4740,4198,3497,2632,1777,826,-450,-1604,-2471,-3361,-4566,-5740,-6559,-7160,-7499,-7125,-6356,-5174,-3596,-1965,-554,704,1899,2759,3394,3763,3882,3955,4047,4207,4306,3925,2892,1592,99,-1903,-3715,-4883,-5683,-6053,-6096,-5842,-5460,-5119,-5094,-5426,-5823,-6283,-6607,-6628,-6363,-5726,-5018,-4574,-4118,-3483,-2750,-2106,-1227,20,1245,2324,3068,3884,4994,6104,7052,8174,9779,11809,13548,15106,16520,17714,18626,19199,20115,20798,21183,21291,20453,18613,16177,12967,8303,3165,-1082,-5228,-9550,-12960,-15166,-16531,-17556,-18003,-18027,-17776,-16973,-15558,-13880,-11843,-8852,-5638,-2433,144,2225,4050,4911,4888,4277,3220,1954,971,89,-818,-1636,-2333,-3124,-4261,-5430,-6388,-7137,-7646,-7538,-6954,-5851,-4051,-2107,-564,678,1716,2301,2606,2823,3112,3368,3607,3836,4129,4192,3790,2886,1180,-918,-2991,-4471,-5440,-6003,-6023,-5823,-5433,-4777,-4135,-3907,-4069,-4361,-4441,-4304,-4084,-3738,-3362,-3379,-3699,-4349,-4574,-4212,-3730,-3025,-1794,-357,1229,2845,3999,4680,4746,3896,3044,2996,3900,5481,7519,9812,12454,15510,17965,19924,21484,22344,22440,22028,21369,20363,18218,14929,11841,7941,2939,-2165,-6283,-9601,-12802,-15370,-16736,-17399,-17669,-17343,-16694,-15777,-14024,-11839,-9653,-7215,-4136,-1292,547,2092,3440,3887,3841,3097,1877,743,-484,-1294,-1848,-2532,-3170,-3874,-4673,-5444,-5972,-6118,-6058,-5677,-4588,-3327,-1668,457,2035,2746,2708,2086,1460,1137,974,1075,1062,1091,1250,1307,1027,227,-1092,-2753,-4162,-4793,-4878,-4330,-3563,-3380,-3465,-3585,-3643,-3755,-4063,-4331,-4041,-3634,-3406,-3026,-2746,-2915,-3629,-4467,-4534,-3441,-2199,-930,570,1827,2106,1612,633,-240,-598,-680,498,3709,7037,10315,13217,15002,16015,16578,16959,17978,19578,20762,22552,23834,23890,23316,20158,14464,7620,2038,-3573,-8265,-10943,-12295,-12786,-13317,-14157,-15005,-15333,-16122,-16412,-15592,-14178,-11037,-6547,-2960,348,3262,4071,3734,2864,1456,242,-372,-947,-923,-751,-842,-1282,-2674,-4499,-6363,-7854,-8874,-8671,-7571,-5986,-3801,-1468,528,1638,2208,2006,1432,853,353,670,1744,2747,3371,3122,2166,1285,347,-477,-1183,-1725,-2318,-2941,-3092,-2940,-2634,-2702,-3659,-4815,-5865,-6647,-6590,-5999,-5270,-4638,-3995,-3352,-2743,-1971,-1677,-2040,-2528,-2677,-1492,416,2320,3765,3759,2605,825,-1187,-2015,-1544,-220,2096,4912,7406,9398,10871,11812,12903,14660,17566,20692,22814,24349,24780,23753,22037,19173,14553,8766,2710,-1568,-4842,-7542,-9338,-10956,-12719,-14811,-16655,-17349,-17092,-15930,-13880,-11750,-9238,-5614,-1917,791,2600,3420,3013,2032,1222,732,775,961,727,-205,-1619,-3046,-4639,-6289,-7504,-8076,-8235,-8002,-7181,-6136,-4856,-3327,-1863,-556,383,1079,1890,2796,3539,4270,4558,4195,3487,2333,858,-351,-925,-1149,-1303,-1679,-2145,-2607,-3003,-3153,-3229,-3286,-3506,-3727,-3802,-3896,-3809,-3688,-3645,-3711,-4083,-4471,-4799,-5233,-5856,-6198,-5768,-4549,-2705,-701,700,878,366,-574,-385,839,2336,3668,4162,4715,6053,8729,11948,13882,14376,14026,13795,14811,17118,20188,22580,23220,22365,20008,16658,13664,10432,5983,1249,-2498,-5532,-8051,-10146,-11624,-13055,-14784,-16252,-17057,-16839,-15020,-11828,-8146,-5371,-2983,-752,535,1223,1821,2305,2808,2885,2610,2004,1006,170,-667,-1899,-3486,-5179,-6887,-8278,-8747,-8330,-7631,-6806,-5969,-5231,-4036,-2165,-276,1042,1797,2058,2022,1981,2143,2511,2539,2025,1292,673,321,194,13,-504,-1484,-2505,-3172,-3556,-3655,-3436,-3216,-3273,-3562,-3759,-3823,-3712,-3733,-4038,-4450,-4941,-5224,-4904,-4150,-3244,-2357,-1808,-1624,-1528,-1218,-779,-407,0,313,895,1709,2836,4537,6202,7852,9155,10085,11155,12538,14179,16249,18501,20662,22315,23145,22626,20411,17992,15192,11142,6500,2700,-316,-3381,-6630,-9176,-11328,-13381,-15036,-16410,-17040,-16144,-14255,-12327,-10131,-7374,-4440,-2527,-1284,74,1140,1814,2169,2514,3268,3493,3098,2133,496,-1146,-2876,-4769,-6242,-7046,-7309,-7334,-7210,-6338,-5581,-5210,-4688,-3646,-2180,-798,169,1072,1839,2385,2457,1953,1822,1924,1523,735,119,-239,-551,-1265,-1914,-2282,-2644,-3102,-3536,-3636,-3206,-2674,-2306,-2170,-2141,-2300,-2772,-3173,-3414,-3530,-3689,-3888,-4000,-4104,-4317,-4399,-4125,-3236,-2033,-1115,-1,1553,2977,3871,4237,4766,5729,6488,7297,7989,8235,8215,7982,8392,10607,13434,16467,19408,21054,21454,20585,18878,16235,13131,10206,6943,2893,-534,-2965,-5570,-8692,-11815,-14218,-15939,-17194,-17050,-15735,-13673,-11031,-8632,-6789,-5166,-3265,-1534,-207,1345,2967,4045,4625,4841,4714,3798,2405,667,-1412,-3320,-4660,-5519,-5769,-5748,-6111,-6451,-6523,-5849,-4952,-4442,-3864,-3257,-2903,-2610,-1990,-633,821,1401,1406,1238,1302,1503,1639,1804,1614,922,-135,-1442,-2152,-2318,-2451,-2603,-2736,-2791,-2876,-2860,-2662,-2640,-3041,-4053,-5007,-5132,-4637,-3779,-2893,-2443,-2523,-2872,-3104,-2404,-1119,563,2787,4439,4974,4596,3512,3096,3406,4013,5087,6104,6626,6502,5955,6597,8496,11248,14547,17294,19264,20601,20841,19657,17913,15545,12066,7914,4596,1837,-1003,-3909,-6658,-9563,-12945,-15896,-17675,-17933,-16912,-14667,-12054,-9853,-7774,-5460,-3420,-1922,-366,1526,3269,4500,5361,5938,5949,5312,4059,2088,-144,-1958,-3546,-4962,-5661,-5975,-6286,-6903,-7660,-7970,-7678,-6541,-5077,-3984,-2875,-1734,-666,144,834,1587,2000,1737,1175,588,384,382,91,-366,-952,-1702,-2400,-2898,-2700,-2070,-1710,-1670,-1823,-2068,-2263,-2554,-2777,-2919,-3244,-3848,-4452,-4818,-4786,-4233,-3200,-1877,-872,63,1115,1839,2377,2897,3875,5089,5933,6666,7116,7103,6854,6240,5994,6874,8440,10668,13410,15543,16785,17279,17014,15971,14494,12869,10694,8099,5709,3073,197,-2265,-4460,-6764,-9684,-12364,-13911,-14822,-14771,-13349,-11510,-9948,-8690,-7407,-5726,-4152,-2485,-204,1804,3147,3926,4147,4162,3874,3431,2760,1861,1132,258,-954,-2075,-2954,-3695,-4072,-4141,-4088,-4226,-4861,-5451,-5924,-6268,-6217,-5620,-4705,-3788,-3098,-2365,-1773,-1236,-842,-747,-390,96,556,1062,1319,1361,1106,233,-789,-1682,-2618,-3759,-4723,-5072,-5047,-4846,-4338,-3921,-3615,-3534,-3568,-3263,-2611,-1621,-109,1575,3490,5302,5827,5624,5007,3919,3161,3296,4579,6704,8318,9188,9760,10204,10329,10430,11149,12487,13804,14376,14585,14831,14373,12101,9153,5694,1760,-1805,-4201,-5426,-5800,-6417,-7496,-9126,-11008,-12390,-13163,-12998,-11389,-9074,-7204,-5908,-4638,-3440,-2769,-1986,-802,699,1947,2730,3271,3670,3520,2961,1953,866,307,-37,-206,-99,214,194,-546,-2257,-3821,-4846,-5483,-5538,-4816,-3929,-3550,-3961,-4554,-4772,-4635,-4164,-3379,-2423,-1538,-855,-382,-76,49,-219,-878,-1440,-1865,-2086,-1985,-1837,-1821,-2268,-3030,-3581,-3850,-3949,-3625,-3079,-2535,-2178,-1899,-1203,-341,301,1177,2631,4101,5009,4735,4264,4608,5429,6292,7182,8677,10487,11479,10693,9746,9395,9586,10017,10995,13353,17016,19029,18222,14960,9207,2986,-1715,-4893,-6112,-5782,-5903,-7284,-9910,-13390,-16157,-17343,-16838,-14568,-11306,-8476,-6081,-3729,-2154,-1438,-892,-305,643,1656,2800,4406,5716,6013,5232,3223,1102,-59,-369,263,1258,1555,850,-1341,-3810,-5107,-5260,-4096,-2642,-1903,-2043,-3229,-4623,-5285,-5142,-4489,-3731,-3154,-2712,-2248,-1544,-951,-893,-1268,-2145,-2924,-3034,-2515,-1174,238,792,563,-392,-1370,-1772,-1881,-1657,-1434,-1530,-1829,-2338,-2578,-2460,-1989,-1041,116,922,1792,3208,4899,6175,6307,5890,5562,5640,5932,6391,6970,7728,7827,7139,6211,6445,7918,9839,11679,12816,13187,12760,11197,8867,7170,6092,4723,2896,1137,-294,-1612,-3655,-6310,-9422,-12967,-15501,-16693,-16504,-14597,-12019,-10352,-9723,-9725,-9390,-8172,-6177,-3327,-78,2083,2771,2740,2528,2321,2420,3071,4139,4958,5004,4644,4208,3387,2019,403,-1268,-2060,-2359,-2702,-2927,-3160,-3695,-4491,-5372,-5443,-4808,-3894,-2728,-1975,-1844,-2092,-2453,-2490,-2276,-1965,-1460,-940,-716,-779,-708,-269,529,1107,1245,1210,1134,1038,1126,1535,2183,2566,2306,1440,559,-25,-232,-233,-71,103,-6,-87,287,1059,2224,3403,4076,4524,4980,5789,6881,7833,9080,10367,10851,10686,10228,9850,9607,9072,8425,7445,5708,3477,1470,-88,-1444,-2589,-3544,-4740,-6396,-8231,-9684,-10577,-10937,-10816,-10560,-10229,-9487,-8430,-7434,-6251,-4962,-3943,-3364,-3007,-2205,-860,930,2945,4342,4881,4682,4162,3785,3496,3331,3165,2648,1701,482,-1023,-2662,-3971,-4825,-5411,-5899,-6012,-5917,-5727,-5422,-5014,-4581,-4017,-3247,-2399,-1687,-1022,-292,175,370,505,700,1024,1304,1724,2407,2895,3113,2985,2786,2722,2902,3222,3598,3725,3279,2473,1483,617,253,376,733,1010,911,548,-46,-599,-640,-245,231,748,1053,1274,1572,2030,2781,3603,4496,5327,5693,5896,6094,6210,6150,5928,5515,4871,3797,2719,2137,1641,870,-186,-1168,-2114,-3353,-4490,-5097,-5437,-5683,-6031,-6364,-6351,-6224,-6034,-5748,-5448,-5019,-4480,-3979,-3363,-2453,-1538,-894,-413,65,547,969,1414,1903,2225,2299,2166,1775,1322,1010,643,120,-450,-1000,-1422,-1897,-2483,-2899,-3143,-3343,-3365,-3051,-2484,-1848,-1271,-904,-737,-629,-360,256,1060,1929,2788,3328,3426,3256,2769,2297,2094,2017,2041,2116,2086,1946,1500,793,287,-83,-380,-419,-326,-25,273,268,141,-51,-250,-345,-371,-219,32,145,164,75,-26,12,83,197,483,905,1303,1456,1436,1369,1223,1049,903,804,803,704,311,-227,-740,-1041,-1158,-1181,-1092,-1021,-1075,-1124,-1116,-1042,-892,-729,-498,-252,-137,-7,235,527,764,838,769,652,521,429,430,519,636,693,638,561,436,196,-113,-420,-607,-713,-732,-659,-634,-817,-1236,-1722,-1989,-2009,-1740,-1162,-586,-83,383,696,928,1155,1296,1445,1595,1744,1946,2144,2252,2244,1951,1326,574,-121,-678,-1094,-1204,-1111,-1027,-1075,-1350,-1752,-2184,-2605,-2767,-2605,-2323,-1912,-1513,-1264,-1111,-1072,-1113,-1043,-913,-683,-317,121,601,1040,1173,1094,961,751,623,677,925,1238,1519,1552,1451,1151,710,325,82,50,102,78,94,-19,-330,-634,-949,-1102,-1101,-1002,-787,-559,-409,-293,-262,-260,-111,106,425,761,1015,1134,1168,1147,1221,1385,1562,1656,1602,1446,1194,902,568,251,-52,-288,-436,-530,-457,-309,-229,-207,-279,-390,-410,-276,116,612,1061,1503,1659,1551,1334,1046,921,952,1075,1240,1282,1162,886,449,-4,-427,-731,-995,-1323,-1576,-1755,-1870,-1927,-2051,-2204,-2405,-2595,-2672,-2571,-2373,-2083,-1791,-1603,-1383,-1037,-540,-65,390,735,861,777,622,479,440,499,603,733,857,810,679,488,230,-18,-221,-334,-203,105,343,510,488,277,7,-241,-350,-265,-113,13,65,-85,-271,-513,-758,-845,-839,-720,-460,-184,33,207,296,344,332,390,577,908,1239,1520,1591,1446,1162,816,478,293,244,202,50,-221,-530,-730,-765,-607,-301,-19,141,299,493,697,973,1245,1494,1608,1577,1535,1489,1477,1427,1234,999,744,423,83,-137,-244,-331,-534,-831,-1118,-1417,-1680,-1799,-1813,-1807,-1786,-1790,-1753,-1670,-1490,-1196,-853,-565,-294,41,418,783,1123,1351,1305,1176,1065,1021,1117,1246,1197,928,438,-34,-452,-731,-827,-832,-855,-967,-1164,-1317,-1382,-1400,-1390,-1373,-1322,-1158,-874,-575,-336,-214,-237,-320,-306,-113,254,630,876,952,761,463,219,78,105,245,352,476,542,452,345,255,205,216,224,301,434,450,371,113,-271,-583,-805,-801,-503,-50,335,583,681,609,500,489,726,1149,1551,1884,2102,2123,1956,1645,1220,852,633,493,442,411,334,113,-309,-833,-1288,-1622,-1820,-1789,-1608,-1409,-1258,-1222,-1299,-1334,-1276,-1037,-651,-208,252,573,751,827,891,938,1023,1097,1114,1063,1003,938,787,425,-50,-444,-812,-1103,-1184,-1114,-993,-955,-1070,-1243,-1422,-1541,-1469,-1271,-991,-642,-369,-171,-33,28,49,44,70,137,183,279,371,467,477,287,90,-20,-33,103,250,329,353,264,219,282,430,666,814,875,780,553,344,143,-5,-113,-215,-288,-354,-389,-410,-489,-594,-629,-557,-312,160,769,1195,1419,1498,1383,1288,1271,1373,1586,1712,1660,1398,875,233,-313,-774,-1165,-1381,-1487,-1482,-1383,-1225,-1099,-1040,-1042,-1062,-1019,-826,-438,62,447,630,624,418,205,70,74,236,388,530,617,633,616,552,417,214,28,-84,-145,-200,-242,-312,-487,-759,-1045,-1248,-1324,-1279,-1150,-994,-861,-728,-596,-460,-288,-38,140,248,332,378,409,448,509,581,552,479,440,397,416,432,348,167,-87,-303,-411,-395,-222,11,135,191,105,-94,-260,-390,-454,-399,-300,-178,-34,37,40,-25,-148,-227,-214,-55,284,753,1196,1580,1882,1929,1824,1675,1506,1414,1387,1276,974,537,47,-466,-1049,-1505,-1731,-1885,-1871,-1708,-1457,-1206,-978,-707,-464,-296,-140,75,339,560,706,765,686,547,351,133,-17,-88,-86,-84,-96,-107,-142,-122,-93,-75,-43,-51,-91,-131,-148,-102,-100,-151,-252,-370,-472,-570,-620,-648,-630,-587,-502,-370,-196,-40,13,44,50,5,25,98,249,420,486,468,379,245,73,-128,-292,-371,-396,-338,-232,-125,-14,55,101,107,76,34,63,190,324,424,491,521,466,370,270,174,180,249,426,702,1016,1232,1321,1342,1242,1106,959,850,853,859,803,584,206,-224,-732,-1290,-1680,-1793,-1783,-1611,-1355,-1182,-1057,-922,-775,-605,-333,44,449,747,933,1001,876,652,475,331,247,243,202,122,-72,-365,-623,-788,-857,-757,-576,-412,-315,-343,-427,-519,-600,-615,-538,-391,-161,-5,35,2,-87,-199,-273,-213,-90,113,289,419,436,305,136,5,-37,25,184,314,347,255,40,-165,-331,-471,-516,-497,-471,-411,-387,-371,-338,-293,-248,-173,-31,208,448,645,830,964,1046,1073,1073,1103,1099,1113,1136,1101,1033,954,831,722,622,478,326,144,-19,-117,-184,-237,-334,-514,-681,-846,-1000,-1088,-1095,-1069,-988,-926,-904,-833,-753,-645,-547,-413,-241,-102,28,158,284,412,483,504,501,485,459,421,411,377,344,295,217,127,12,-93,-242,-365,-429,-459,-410,-321,-259,-218,-234,-254,-242,-206,-187,-159,-138,-102,-82,-117,-78,-56,-63,-68,-68,-54,-37,10,96,196,307,360,352,320,225,94,-35,-140,-236,-349,-415,-463,-465,-509,-549,-569,-581,-507,-373,-138,170,514,793,982,1124,1232,1281,1311,1340,1332,1279,1158,985,718,400,137,-121,-396,-613,-772,-894,-962,-989,-1003,-1005,-980,-869,-666,-494,-360,-265,-214,-204,-227,-199,-84,28,155,232,222,175,86,-8,-15,8,97,253,426,555,624,620,559,485,415,378,396,434,456,391,244,81,-120,-370,-549,-548,-505,-437,-346,-276,-230,-218,-211,-157,-81,-29,33,88,108,91,-6,-137,-248,-315,-339,-257,-102,40,85,8,-88,-183,-256,-243,-171,-71,9,0,-42,-158,-285,-436,-557,-602,-582,-448,-260,-77,87,232,294,356,431,571,772,957,1099,1173,1161,1072,897,701,542,412,242,25,-233,-451,-652,-827,-881,-902,-878,-811,-684,-579,-515,-437,-358,-306,-239,-147,4,154,227,235,213,159,112,56,43,161,267,338,335,328,297,156,80,86,163,189,208,253,226,160,13,-171,-311,-394,-424,-310,-178,-43,42,32,21,-23,-16,31,160,354,525,614,617,557,455,317,275,253,221,190,133,49,-76,-296,-513,-657,-728,-725,-667,-605,-536,-485,-524,-576,-577,-483,-387,-290,-175,-27,-53,-162,-222,-217,-79,111,374,706,965,1021,943,750,556,418,387,474,691,818,737,456,34,-299,-320,109,1245,2466,3162,3007,1778,-614,-2883,-4863,-6317,-6406,-5503,-3948,-1951,-303,495,879,909,1054,1259,1942,2687,3266,3322,2910,1857,546,-440,-1126,-1352,-1092,-447,48,404,408,171,-220,-499,-775,-684,-482,-80,314,640,758,798,536,127,-279,-645,-968,-952,-717,-308,214,593,826,910,1017,1027,1158,1229,1279,1005,721,100,-580,-1254,-1602,-1664,-1477,-1049,-512,-86,70,74,-87,-301,-433,-368,-192,138,362,476,358,204,-171,-152,104,586,1488,2120,1707,1225,59,-1660,-2836,-2919,-2800,-1171,1389,3017,4533,4860,3894,2092,220,-2195,-3396,-3956,-3865,-3141,-2000,-902,-15,210,-3,-106,-547,-886,-1303,-1047,-1171,-674,-520,201,379,803,894,1065,797,743,486,375,251,168,423,712,1553,1717,2341,2045,1789,920,312,-525,-615,-1087,-1001,-1046,-820,-1135,-1212,-1582,-1986,-2074,-1962,-868,390,1220,1980,2608,2116,1284,1194,1034,491,671,992,1078,983,953,704,110,-19,-290,-470,-621,-626,-903,-1040,-1197,-1291,-1226,-1112,-912,-519,-364,-247,-287,-369,-607,-587,-435,58,596,886,1091,915,780,720,506,556,396,647,207,362,294,357,454,153,-308,-788,-1089,-1415,-1052,-659,-551,-300,-652,-885,-1161,-918,-570,145,24,-99,-257,-575,-108,161,1029,1025,1438,1253,1089,942,543,472,-18,-364,-234,-239,223,95,391,356,-127,-854,-1279,-927,-740,112,358,371,-272,-902,-870,-1351,-117,488,1865,901,1339,600,-137,101,-255,516,-255,572,469,398,851,467,1190,493,646,242,-449,-508,-911,227,-343,-51,-266,-706,-1113,-606,-971,-239,-4,-107,-1038,-72,-221,-45,-400,-99,-127,350,706,249,1017,167,1100,-332,570,138,1073,-393,533,1192,350,291,179,-916,-1516,-1510,-858,-1209,145,-587,74,-419,-1014,104,-1669,-828,-2238,640,-235,858,1227,615,377,68,-592,599,-163,708,793,1431,651,397,777,-822,528,-1167,1891,-606,3021,319,-16,131,-2031,285,-1522,258,-1792,824,-537,490,-881,-36,-1625,-529,-2289,624,-46,1317,-950,1284,-541,-461,780,-453,946,855,1563,1263,744,1467,-60,-628,807,-613,813,-147,1093,-1578,924,-2777,266,-1004,-1326,262,-1179,1394,-873,1106,-1225,-54,-1014,211,-56,859,-123,785,-719,298,-379,501,223,526,362,951,-97,412,897,90,-241,-83,-518,-501,-919,570,-477,425,-271,-970,-442,-1898,42,-1034,654,-336,788,-1068,245,-617,-1230,618,-400,1335,171,1052,-654,1231,-2248,1159,-717,1776,-1068,1734,999,781,872,383,-631,-524,-534,-732,240,-626,-169,-451,-595,-1004,-1390,-31,-542,-133,-187,-295,-222,-609,692,163,716,256,143,1820,-138,1848,1101,1014,1335,1070,351,1213,-373,1341,-145,219,-664,907,-818,-2007,707,-1480,-718,-1876,-664,-2260,-155,-1553,-627,-225,-358,-213,-410,723,-682,1284,-393,1471,618,1486,265,1799,580,1082,673,817,-107,591,-189,881,-811,-238,-1069,-342,-1420,-324,-1437,-490,-871,-386,-1331,-1528,1186,-1808,-317,-85,-412,-210,-501,-388,630,-590,906,1054,90,856,-794,2380,-1218,714,415,945,820,901,1272,223,726,-425,1023,-12,365,228,-382,-1499,-898,-1347,-778,-346,38,-830,721,-668,862,-774,-184,-679,608,397,-317,519,764,-294,611,643,-1087,1136,-195,359,377,967,89,1886,-1810,568,-578,-145,111,-661,647,-1104,1948,-1523,481,-1951,1260,-2694,1230,-648,615,1358,-322,319,-784,359,647,362,1173,431,443,924,-482,1801,-1036,820,-358,525,-1072,88,-1960,1637,-517,-851,166,591,-1108,-682,827,-2171,1309,-347,1166,-1020,474,973,-1972,1027,-809,-126,1317,-113,-1116,-202,-849,-136,-2443,862,78,289,1252,-127,580,-955,1549,-857,1252,-1052,2522,-1309,825,-694,785,-543,-35,1,-727,-1529,1783,-546,-618,562,-195,-706,1151,-1291,10,284,488,739,351,1900,-1927,1777,-886,1319,-173,2715,-245,-310,682,-765,240,-484,-429,-643,-1026,-889,-334,-1319,-105,-1320,1414,-3185,1216,-1509,1370,-837,1055,360,1292,406,1421,-32,2317,-510,671,203,935,1985,-57,19,665,-1963,-754,-1461,-1640,850,-1640,681,-769,-348,-1155,-1169,-250,-712,42,714,43,2271,-120,-838,211,167,-647,459,773,-439,731,-731,176,-1751,-234,193,271,688,-141,692,54,583,-1301,402,-262,1266,-1234,568,493,-791,192,-901,670,54,275,129,190,99,59,-860,-63,-599,-734,-316,-648,177,-1893,-27,-491,-457,40,-312,746,648,1314,70,1324,440,457,751,558,468,225,-278,1154,-663,-411,-1452,-187,-24,-471,-1668,269,-515,-13,-642,219,443,-351,2659,-689,1496,682,1219,499,786,332,890,-573,192,-1137,1321,-1225,1,-353,-1027,-178,-621,-615,-643,879,-996,-610,276,-1061,-309,526,-647,322,-834,867,-538,770,790,493,429,99,554,-1458,-108,575,-497,126,1347,-1321,812,-726,-418,-139,-14,247,-339,2495,708,-739,712,-898,-466,-132,205,673,-762,1386,-623,-1368,-225,-1024,-705,-362,389,-548,240,-649,399,-665,-278,-101,443,47,763,551,1124,-411,146,503,-1415,214,863,1038,-786,752,370,1272,-3120,1494,-213,289,400,-78,447,107,-1270,1443,-816,700,-797,1251,390,-69,211,-531,70,-1039,78,27,1019,-590,166,698,-1235,-207,-202,-1324,572,503,655,-1572,339,-206,-1294,480,433,125,298,730,979,-645,-721,109,47,-415,353,435,129,117,-469,-118,-473,-1189,494,141,-1071,115,562,162,-2552,511,-415,-194,557,685,219,224,524,-45,-651,438,-930,66,-155,341,189,-599,-464,-314,326,-1332,924,-82,-748,-749,411,-113,-286,137,386,-720,1272,-1850,1556,-361,402,-114,208,1105,237,736,330,-107,-302,-220,895,23,-76,510,700,-154,579,1611,-1059,349,363,-756,197,497,-875,1169,-643,-245,-95,-918,1325,-874,902,321,335,261,-1518,90,-443,-2,522,-781,979,389,-972,-143,-1055,-66,-395,304,1065,81,484,279,293,322,-565,-114,-1097,867,-159,1,-513,715,-1265,-652,-669,-840,-354,537,-46,487,-276,-61,-540,-761,106,-104,431,-11,1061,575,108,-738,170,-460,-631,1307,-7,519,-347,925,-58,-1838,470,100,-33,-284,458,977,-1678,1029,-993,1235,-1987,1082,438,385,-493,750,-165,99,-807,915,-223,981,-319,-27,30,162,295,-376,619,-568,1887,-738,1008,-589,-107,1071,-879,1166,-1237,294,646,-359,-124,701,-261,5,-3,-186,352,-333,-233,218,319,1318,-1238,465,191,-744,576,-1172,-333,863,-955,-338,1021,-1244,222,-292,-82,695,-991,1972,49,-441,327,-1034,-301,468,-1024,771,289,-5,-934,-1169,135,-863,-585,529,539,-926,1428,-717,108,-1034,-60,997,-738,893,-682,689,166,325,-1422,630,-24,-808,1418,-989,491,-824,-349,388,-1636,773,-394,829,-1891,-97,-263,-62,-775,63,149,813,256,246,898,-531,1641,-851,-389,59,830,187,180,209,1005,295,1190,1143,-988,747,-470,888,-1492,383,-113,988,-179,436,567,-133,339,-1598,-751,-653,-675,133,247,156,-187,-550,-235,-293,204,-268,-353,1290,429,-496,706,-43,417,-1008,490,-632,808,-146,1129,100,-284,-78,-657,-96,-691,1437,-730,690,-2012,553,-594,-1207,-127,-1027,688,-772,301,2091,-1224,-224,-338,0,426,436,895,1066,-1371,859,-529,-417,838,-1171,1427,-229,-1149,1517,-1725,-832,-379,-1690,2014,-431,237,556,-1518,16,-1097,-385,929,-811,1531,825,-634,1185,300,-905,454,0,-537,1354,-273,674,-252,-551,1191,-575,-294,1201,-852,1505,-779,1266,-251,-698,1888,-2485,931,652,-31,-40,422,-664,655,-448,36,-170,-347,1033,-625,32,-307,-1062,156,-942,677,-727,921,-760,44,951,-1053,1371,718,-412,1226,-137,185,36,-411,-485,229,-65,-1183,692,-885,806,-1435,-614,-753,-880,745,-347,350,-241,422,-615,-1112,366,-434,339,149,1186,-771,8,1108,-1337,1443,-446,423,1030,65,356,-436,-77,-1048,-892,383,-463,440,-48,-678,-1364,286,-1837,513,226,-180,2800,-495,961,-2057,807,205,364,1662,-406,583,-1120,-223,-1317,816,975,32,780,303,381,-607,184,79,359,268,2083,78,336,-520,-776,-961,-411,641,114,898,-906,-52,-863,986,-755,501,-420,-1186,1586,215,562,-1011,-515,-227,23,-15,681,-36,973,-2102,-45,-408,-323,1442,-148,-277,143,739,523,94,758,-141,-673,1033,-521,361,-846,-306,-1040,-416,-1134,49,-245,-343,405,-964,971,43,919,-816,-395,306,-225,1788,-567,-633,540,-632,133,-611,117,192,95,-490,284,-718,-31,1022,-358,1019,491,365,-555,-1294,29,277,491,-626,277,-1095,-476,925,-1200,398,310,705,166,-114,550,-576,1399,938,-221,-862,-230,457,945,459,905,-340,-1312,440,-855,-508,840,-650,-39,-420,-87,-445,-509,912,717,285,-1257,412,-1319,1083,1003,-489,197,-991,77,-503,250,221,199,-112,671,-592,713,180,438,638,1049,287,-916,-560,632,-315,531,659,-892,178,-1699,366,-128,-1138,-32,566,-448,788,-323,-271,-1223,-131,-189,-317,-720,1346,-373,1054,47,-379,1247,-2399,3048,-1015,141,576,-591,668,-175,-742,571,-80,213,318,523,-69,-966,-536,-390,1490,-347,-11,-507,767,-383,1297,-1279,-166,-191,-1206,517,-170,1050,-885,-363,361,647,238,1289,235,329,374,-160,-520,1243,-969,493,65,303,539,-1703,-924,-876,65,254,852,1007,666,-44,-670,-482,-862,551,1169,1633,971,182,-267,-1350,-108,-1590,728,449,154,1112,-1103,-278,-1034,-903,654,125,1236,1524,-202,-343,-1123,-1284,357,-296,631,997,-1065,625,-1995,-915,231,-825,2956,-24,1053,-1014,-1617,301,-1291,752,-449,1210,-339,1961,-1724,789,-644,705,269,1132,471,267,-1637,20,-151,337,1732,-304,399,-544,-1273,-807,-1038,-1761,561,-1236,1926,-491,-488,-314,-663,1048,-309,566,141,-1603,-17,-1132,628,1709,-590,2253,-723,-630,731,-1315,1347,833,-29,1624,663,-164,182,21,411,-194,65,-48,-861,-167,-894,282,366,479,-270,-341,-347,-215,-427,-67,668,-490,-221,14,537,-267,-316,73,568,366,-334,642,-25,298,-891,-701,570,-664,158,-878,1660,-126,480,174,-1023,-389,-155,944,-947,1015,-1424,470,174,42,1194,-369,16,1800,-1027,-35,-534,253,-138,-184,432,671,703,-1252,-358,-1067,506,234,329,879,-94,-33,-548,619,-692,-307,-342,-65,-397,-1793,309,-712,-1138,551,-1558,1262,0,71,-18,691,560,1015,428,1705,261,1289,14,-861,165,-692,73,620,63,721,-925,223,-269,-790,1006,-1057,836,-399,-386,362,-335,365,-260,860,1263,904,-145,-460,-1834,-400,-1409,676,540,552,603,241,1479,148,-409,-6,-1897,266,-556,1179,207,257,-628,-571,588,-166,196,-181,-625,-1784,-1536,-883,-264,-296,84,900,647,533,-312,-369,-232,590,33,1776,1297,1153,88,-134,-271,722,449,62,1048,-1106,-564,-1713,-972,-453,-323,19,254,366,-704,49,-384,453,193,393,1356,423,283,-65,-1064,-837,-608,-1050,362,-476,183,-861,-741,-912,-1375,-348,152,1039,39,853,-414,186,195,-55,965,1030,1420,924,317,532,-306,283,473,429,1265,730,-160,67,31,213,369,674,332,1155,158,158,-643,-410,-533,-919,-373,-1205,-833,-1666,-1034,-1679,-1341,-818,-650,-566,-473,-512,-167,546,-300,892,376,770,1195,1301,1306,1862,1087,1776,407,1084,489,251,-112,181,-380,-174,-179,-1037,39,-735,-239,-72,-912,-437,-728,-1296,-1013,-851,-638,-72,-135,-286,-55,-787,-589,-324,197,186,585,193,207,175,614,444,510,597,124,643,239,569,73,744,572,897,427,469,-14,-22,-101,-210,124,-544,-666,-1495,-293,-634,-255,-990,-369,-305,-570,-339,-477,-169,-333,584,250,716,20,146,41,733,667,1224,926,647,304,-98,780,874,1110,-606,255,-296,-29,835,908,414,-150,-384,-474,-163,-397,-592,-1075,-811,-1205,-1048,-807,-1072,-1237,-976,-233,-309,75,-54,-259,-469,-57,543,896,1215,235,597,74,874,704,1341,-41,174,-393,-88,343,343,319,-492,6,-627,722,107,209,-888,-1061,-483,-253,430,-219,-141,-806,77,-463,622,-235,915,-497,218,292,481,367,-59,325,208,-12,579,-39,248,-201,-418,651,401,416,726,-38,278,-424,-649,406,-555,392,-854,-83,-591,-846,-295,-411,-434,-263,-673,-449,-340,-708,-469,-545,129,-492,390,295,296,852,-69,411,530,309,602,840,824,890,667,634,817,506,450,707,559,70,46,31,70,-536,-424,-436,-434,-238,-483,-875,-580,-860,-902,-498,-469,-759,-673,-831,-626,-33,-340,-283,-302,-2,-521,-14,61,296,-80,236,-77,203,80,249,176,698,619,446,405,158,508,153,746,740,777,488,417,229,719,231,260,274,76,348,-97,227,-226,-138,-671,224,-266,-185,-339,-988,-605,-351,-206,-111,90,-421,-316,-173,261,672,50,515,-29,40,205,254,378,267,221,303,101,471,-50,-159,-44,-51,507,146,301,-775,-661,-903,-160,97,524,-321,-245,-973,-621,-682,-259,-113,-226,-217,49,127,-291,-259,-317,-47,265,597,2,-10,-634,-1084,-534,-522,-224,-703,-1226,-1404,-1583,-1412,-1505,-1512,-1936,-1963,-2132,-1789,-1848,-1746,-2571,-1721,-1848,-1382,-994,-1244,-877,-1162,-510,490,1426,1031,1331,860,1885,1763,2811,2696,3294,2783,3107,3655,4162,4383,4136,3994,4359,4892,4744,4907,4321,4221,3838,3832,4203,4223,3282,2654,1997,2049,1796,1546,992,-23,-82,-772,-836,-824,-1279,-2003,-2648,-2740,-2712,-2851,-2867,-3665,-3273,-3900,-3471,-2981,-3346,-3082,-3348,-3291,-2895,-2457,-2532,-2316,-2669,-2639,-2624,-2011,-1743,-2140,-1946,-2877,-2269,-2680,-2489,-2277,-2645,-2314,-2665,-2575,-2654,-2439,-2934,-2758,-2903,-2602,-2688,-2738,-3024,-3286,-3161,-3328,-2720,-2741,-2683,-2327,-2426,-1995,-1576,-1148,-147,230,674,1322,1677,2742,2957,3980,4153,4463,5295,4960,5874,5826,6451,7088,7362,7394,7449,7393,7652,8434,9146,9586,9828,9439,9128,9589,9468,10215,9829,9446,8553,7882,6521,6496,4858,3801,2781,1508,262,-1448,-2936,-4441,-6482,-7257,-8638,-9107,-10804,-12017,-13238,-13749,-14135,-14013,-14158,-14349,-14230,-14221,-13220,-12500,-11561,-10442,-9826,-8403,-7076,-4946,-4121,-2540,-1560,161,1808,3247,4376,5462,6403,6917,7554,8565,9043,9372,9213,9196,8747,8695,7968,7610,6480,5564,4868,3604,2620,1446,463,-909,-2093,-2968,-3603,-4850,-5390,-6529,-6665,-7071,-7224,-7112,-7439,-7252,-7071,-6742,-6141,-5850,-5057,-4307,-4065,-3330,-2708,-2127,-1278,-870,3,729,1105,1883,2417,3124,3506,3728,4343,4660,5319,6035,6549,7328,7288,8101,8770,9586,10244,10863,11269,11731,12137,11926,12501,12210,11928,11491,10788,10107,8855,7950,6242,4895,2775,1683,-187,-1846,-4093,-5950,-7290,-9503,-10568,-12182,-13094,-14304,-15361,-15761,-16138,-16395,-16058,-16109,-15592,-14459,-13639,-12157,-11408,-9866,-8379,-6888,-5302,-3381,-1439,34,1192,2893,4223,5434,6710,7662,8761,9292,9704,10260,10390,10425,10124,9668,9003,8258,7535,6751,5678,4467,3124,1730,397,-1214,-1956,-3162,-4301,-5332,-6584,-7332,-7961,-8413,-8340,-8561,-8709,-8474,-8355,-7777,-7345,-6563,-6403,-5585,-5178,-3941,-3295,-2320,-1994,-1342,-938,-317,572,1397,2119,2414,2243,2797,3196,4186,4876,5823,6369,7040,7508,8433,9433,9882,10714,11863,12782,13453,13943,13660,13514,13235,13207,13350,12887,11743,9863,7947,6194,5123,3827,1908,-277,-2253,-4352,-6257,-8035,-9543,-10919,-12703,-13788,-14704,-15369,-15928,-16648,-16783,-16703,-16162,-15072,-14308,-13589,-12605,-11361,-9742,-8037,-6056,-4203,-3019,-1707,124,1905,3518,4747,5986,6993,7984,8796,9340,9758,10031,10037,10270,10223,9670,8905,7822,6949,6172,5278,4458,2806,1024,-372,-1720,-2668,-3980,-4781,-5858,-7211,-7906,-8552,-8861,-9152,-9326,-9182,-9183,-8679,-8111,-8022,-7405,-6761,-5624,-4643,-4000,-3081,-2635,-1737,-929,-76,912,1345,1681,2272,2961,3941,4282,4394,4682,4884,6015,6771,7646,8100,7711,8280,9527,10864,11853,12309,12529,12633,12717,13460,13689,13526,13022,11936,11329,10363,9556,8046,5876,4108,2790,1406,-258,-2641,-5183,-7071,-8592,-9643,-10939,-12087,-13671,-15237,-16076,-16247,-16162,-16260,-16328,-16425,-16082,-15003,-13520,-12405,-11250,-10079,-8428,-6672,-4849,-2625,-936,368,1569,3372,5402,6910,7938,8798,9372,10052,10644,11200,11508,11110,10983,10456,9823,8978,8069,6912,5546,4244,3197,1981,153,-1355,-2893,-4049,-5196,-6266,-7099,-8166,-9195,-9918,-10231,-10320,-10297,-10313,-9997,-9759,-9225,-8271,-7617,-6696,-5903,-5023,-3993,-3182,-1780,-979,-375,289,830,1588,2544,3218,3820,4006,4056,4310,4308,5079,5846,6661,7216,7435,7757,8104,9038,10075,10884,11436,11890,12179,12466,12519,12522,12253,11729,11431,10903,10025,8410,6916,5353,3825,2414,1091,-461,-2685,-5003,-6854,-8244,-9521,-10778,-12332,-13497,-14545,-15165,-15601,-15749,-15640,-15659,-15293,-14777,-13817,-12436,-11263,-10240,-9109,-7426,-5283,-3625,-2018,-292,1110,2493,3769,5653,7249,8058,8686,9280,9917,10520,10787,10873,10628,10181,9807,9083,8412,7365,6014,4649,3382,2334,1192,-299,-2235,-3907,-4881,-5552,-6398,-7270,-8416,-9389,-9891,-9855,-9394,-9342,-9337,-9256,-8977,-8109,-6988,-5965,-5332,-4779,-3909,-2675,-1584,-623,19,638,1157,1876,2899,3614,3898,4004,4182,4728,5283,5508,5485,5284,5587,6183,7033,7747,7913,7820,8070,8915,10140,10950,11279,11251,11068,11024,11146,11063,10637,10026,9109,8154,6944,5758,4324,2471,708,-584,-1859,-3580,-5625,-7432,-9026,-10614,-11548,-12271,-13004,-14163,-15217,-15656,-15631,-15164,-14711,-14219,-13758,-13080,-11838,-10254,-8861,-7506,-5936,-4192,-2544,-912,945,2501,3699,4982,6592,8020,8964,9426,9691,9963,10385,10851,11031,10475,9686,8830,7767,6975,6131,5206,3676,1935,597,-653,-1949,-3430,-4933,-6047,-6904,-7694,-8312,-8810,-9367,-9937,-10062,-9738,-9169,-8291,-7727,-7324,-6807,-6084,-4794,-3618,-2480,-1282,-716,-176,397,1219,2071,2555,2998,3115,3210,3465,3742,4030,4044,3798,3683,3727,4006,4596,5169,5945,6200,6478,6867,7612,8804,9843,10611,11080,11248,11393,11585,11730,11642,11042,10524,9845,8840,7550,6056,4566,2641,850,-421,-1771,-3658,-5956,-7901,-9400,-10816,-11807,-12615,-13595,-14708,-15604,-15874,-15744,-15326,-14890,-14553,-13997,-13016,-11520,-9742,-8394,-7063,-5426,-3642,-1962,-110,1944,3683,4884,5973,7451,8973,9956,10512,10801,10787,10896,11081,11170,10721,9782,8681,7280,6056,5108,3993,2436,667,-1151,-2793,-4215,-5635,-6694,-7677,-8518,-9077,-9490,-9914,-10294,-10341,-10148,-9544,-8787,-7840,-7233,-6582,-5656,-4606,-3504,-2449,-1300,-302,299,863,1518,2270,2946,3373,3640,3655,3549,3650,3945,4346,4612,4481,4053,3530,3511,3804,4398,5222,5777,5980,6099,6418,7239,8136,9061,10118,10943,11413,11517,11409,11212,11019,10749,10347,9774,8981,7788,5689,3621,1971,536,-1084,-2842,-4443,-6236,-8497,-10457,-11745,-12752,-13922,-14935,-15502,-15789,-15928,-15855,-15795,-15462,-14906,-13846,-12162,-10547,-8974,-7325,-5875,-4443,-2586,-177,2182,3928,5332,6793,8006,9110,10088,11057,11617,11762,11778,11590,11060,10491,9652,8529,7203,6081,4832,3028,1154,-424,-1945,-3501,-5027,-6170,-7256,-8610,-9637,-10340,-10658,-10724,-10673,-10393,-10140,-9782,-9189,-8298,-7285,-6119,-4675,-3398,-2542,-1654,-604,574,1599,2438,3373,3908,4286,4607,4684,4711,4492,4333,4200,4115,4228,4239,3940,3373,2819,2455,2425,2737,3369,4131,5068,5685,6017,6359,6818,7887,9447,10794,11767,12288,11999,11676,11175,10825,10558,10250,9623,8271,6359,4543,2637,401,-1579,-3162,-4576,-6326,-8358,-10114,-11941,-13854,-15247,-15940,-16240,-16234,-16248,-16247,-16285,-16094,-15349,-13995,-12376,-10613,-8500,-6487,-4954,-3386,-1464,692,2620,4610,6819,8578,9598,10270,10765,11344,11842,12205,12251,11697,10753,9641,8329,7075,6018,4684,2780,706,-1031,-2612,-4322,-5848,-7068,-8192,-9346,-10158,-10684,-11030,-11246,-11165,-10596,-9938,-9123,-8180,-7325,-6490,-5484,-4034,-2364,-1093,117,1245,2215,3042,3775,4504,5184,5528,5933,6176,6026,5622,4936,4250,3734,3477,3343,3140,2732,2052,1052,121,-133,77,605,1648,2972,3911,4326,4672,5496,6912,8267,9796,11660,13072,13453,13089,12470,12064,11781,11411,10870,10038,8793,6767,3866,1268,-688,-2463,-4541,-6466,-7945,-9835,-12467,-14903,-16373,-17236,-17853,-18001,-17681,-17384,-17237,-17058,-16520,-15293,-13400,-11122,-8949,-6745,-4260,-2194,-199,1722,3671,6123,8414,10154,11521,12352,12670,12756,12833,12837,12441,11882,10994,9528,7695,6016,4346,2461,370,-1291,-2948,-4841,-6644,-8160,-9386,-10495,-11143,-11464,-11636,-11554,-11209,-10786,-10050,-8929,-7514,-5963,-4728,-3541,-2072,-637,547,1752,3170,4413,5192,5618,5928,5981,5957,5873,5774,5837,5651,5138,4063,2794,1919,1429,1185,1141,917,397,-608,-1587,-2097,-2136,-1687,-1074,-598,-114,610,1684,2772,3919,5453,7070,8782,10288,11736,13308,14053,14103,13817,13457,13071,12671,11936,10666,8569,6302,3946,1239,-1166,-3156,-5248,-7612,-9880,-11763,-13602,-15530,-16941,-17757,-18223,-18306,-17946,-17425,-16808,-15956,-14663,-13091,-11323,-8942,-6412,-4232,-2037,415,2874,5311,7159,8719,10254,11633,12541,13058,13193,12830,12264,11322,10085,8782,7497,6008,3826,1537,-313,-2029,-3969,-5761,-7198,-8507,-9911,-10908,-11448,-11687,-11730,-11537,-11065,-10244,-9016,-7571,-6334,-5054,-3586,-2114,-757,660,2296,3687,4786,5564,6029,6631,7216,7715,7980,7748,7037,6224,5303,4369,3605,2988,2075,716,-621,-1464,-2013,-2362,-2609,-2834,-3124,-3411,-3374,-3228,-2966,-2743,-2284,-1315,346,2365,4352,5752,6861,8366,10395,12563,14523,15940,16028,15515,14919,14422,13978,13245,11907,9327,6250,3820,1671,-910,-3866,-6500,-8967,-11434,-13352,-14625,-15865,-17391,-18675,-19132,-18768,-17605,-16351,-15446,-14649,-13279,-11265,-8751,-6526,-4481,-2273,-37,2045,4349,6970,8950,9949,10664,11537,12452,13101,13122,12269,10685,9193,7887,6538,4965,3277,1240,-1148,-3077,-4274,-5319,-6750,-8388,-9655,-10441,-10800,-10655,-10426,-10221,-9987,-9373,-8325,-6824,-4946,-3331,-1876,-686,675,2333,3893,4942,5622,5994,6418,6821,7184,7335,6852,6185,5487,4783,4136,3546,2699,1556,200,-882,-1776,-2659,-3369,-3814,-4103,-3947,-3669,-3530,-3505,-3399,-3006,-2435,-1642,-745,-182,72,440,1428,2916,4638,5754,6724,7737,8984,10274,11730,13034,13726,13699,13405,12910,12218,11452,10294,8443,6376,4640,2915,789,-1710,-3973,-6199,-8479,-10103,-11154,-12030,-13091,-14068,-14699,-14901,-14696,-14059,-13460,-12749,-11661,-10268,-8838,-7332,-5513,-3753,-1958,-413,1338,3461,5327,6552,7372,8122,8690,9013,9063,8743,7950,7040,6098,4950,3721,2445,830,-1161,-2954,-4103,-4911,-5718,-6440,-7093,-7711,-8190,-8290,-8093,-7740,-7174,-6339,-5365,-4265,-2892,-1653,-547,326,1317,2709,4111,5148,5821,6251,6427,6430,6373,6119,5646,5135,4548,3832,3081,2281,1283,-226,-1704,-2672,-3334,-3904,-4436,-4911,-5375,-5633,-5474,-4945,-4343,-3628,-2993,-2420,-1703,-797,117,798,1384,2087,3102,4549,6052,7463,9054,10382,11290,12164,13128,14022,14545,14643,14232,13413,12462,11264,9388,7130,5061,3025,633,-1694,-3634,-5650,-8155,-10499,-12050,-13089,-13898,-14515,-14895,-15109,-15032,-14463,-13721,-12761,-11564,-10208,-8910,-7394,-5326,-3305,-1544,-232,1045,2708,4477,5827,6950,7809,8158,8209,8143,8019,7642,6967,6048,4691,3307,2150,986,-465,-2031,-3272,-4284,-5045,-5460,-5771,-6110,-6511,-6644,-6441,-5926,-5108,-4256,-3648,-2964,-1990,-721,420,1419,2334,3023,3684,4311,4886,5304,5311,5033,4615,4116,3634,3190,2487,1429,249,-566,-1285,-2149,-3128,-4007,-4808,-5581,-5982,-6132,-6174,-6284,-6253,-6000,-5118,-3721,-2192,-1130,-365,361,1177,2106,3134,4454,5444,6353,6905,7718,8625,9580,10193,10769,11389,12054,12578,12902,12931,12368,11636,10561,9417,7979,6708,5054,2846,511,-1335,-3138,-5087,-7048,-8628,-10028,-11406,-12203,-12565,-12740,-12857,-12822,-12566,-12029,-11067,-9875,-8842,-7841,-6612,-5230,-3644,-2332,-1092,239,1420,2459,3499,4743,5634,6013,5980,5786,5490,5359,5040,4395,3376,2286,1282,140,-789,-1589,-2387,-3377,-4119,-4510,-4593,-4648,-4691,-4784,-4728,-4389,-3688,-2952,-2157,-1315,-460,360,1290,2419,3257,3788,3892,3972,4079,4344,4493,4437,3911,3089,2195,1322,291,-706,-1506,-2230,-3032,-3750,-4338,-4963,-5683,-6311,-6586,-6568,-6166,-5485,-4824,-4113,-3220,-2248,-1384,-411,915,2278,3285,4194,5090,5970,6627,7374,8209,8780,8883,8699,8344,8024,7883,7929,7984,7959,7686,7254,6762,6115,5351,4717,4073,3319,2685,2027,1284,57,-1397,-2717,-3800,-4805,-5497,-5976,-6395,-6868,-7260,-7550,-7637,-7608,-7450,-7171,-6744,-5980,-5176,-4566,-4123,-3692,-3256,-2732,-2024,-1164,-484,-99,175,513,870,1178,1336,1397,1286,1194,1148,1198,1109,923,592,142,-175,-333,-391,-566,-780,-976,-1064,-1080,-900,-740,-674,-628,-480,-168,198,509,720,836,864,962,1216,1488,1587,1440,1058,582,187,-120,-514,-883,-1245,-1586,-2010,-2411,-2755,-3173,-3620,-3902,-3899,-3753,-3376,-2987,-2760,-2606,-2445,-2213,-1877,-1401,-670,246,1213,2061,2785,3517,4060,4329,4622,5072,5559,5919,6167,6152,5911,5412,4788,3958,3301,2923,2909,3231,3673,3958,4007,3842,3536,3353,3191,3223,3283,3326,3272,3086,2685,2077,1248,252,-647,-1190,-1456,-1622,-1721,-2019,-2432,-2907,-3519,-3956,-4163,-4293,-4282,-4245,-4188,-4219,-4431,-4697,-5004,-5182,-5206,-5022,-4722,-4386,-3972,-3529,-3172,-2736,-2132,-1521,-964,-471,186,784,1244,1624,1913,2157,2220,2190,2152,2105,1977,1840,1653,1585,1486,1326,1052,652,192,-167,-447,-692,-910,-1126,-1354,-1646,-1903,-2177,-2437,-2635,-2774,-2762,-2690,-2551,-2459,-2542,-2586,-2469,-2226,-1924,-1610,-1236,-837,-536,-183,265,633,838,1020,1273,1609,1939,2144,2248,2320,2342,2398,2618,2880,2977,2914,2735,2477,2171,1914,1698,1423,1128,889,698,536,363,253,232,409,800,1103,1456,1831,2079,2225,2399,2660,3004,3273,3562,3987,4292,4462,4538,4484,4325,4048,3789,3550,3302,2969,2651,2146,1344,357,-569,-1465,-2369,-3230,-3879,-4411,-4999,-5541,-5992,-6366,-6806,-7129,-7201,-7044,-6527,-5838,-5250,-4592,-3862,-3154,-2551,-1946,-1118,-308,339,923,1601,2095,2434,2589,2673,2671,2585,2470,2338,2049,1609,1206,805,388,-18,-403,-819,-1386,-1910,-2305,-2554,-2855,-3132,-3346,-3554,-3643,-3658,-3582,-3432,-3222,-2900,-2564,-2166,-1530,-966,-479,-48,533,1136,1558,1955,2294,2456,2521,2531,2529,2512,2341,2183,1927,1559,1103,691,378,39,-155,-265,-373,-515,-745,-1017,-1248,-1404,-1369,-1258,-1019,-748,-456,-168,116,413,753,1066,1455,2028,2663,3196,3640,4095,4450,4728,4976,5349,5761,6234,6540,6812,6930,6852,6604,6182,5617,4986,4484,4007,3417,2661,1925,1019,-56,-1071,-1733,-2096,-2319,-2503,-2789,-3265,-4045,-4874,-5527,-6077,-6567,-6862,-7020,-6959,-6812,-6713,-6647,-6700,-6628,-6270,-5744,-5040,-4052,-3246,-2547,-2092,-1692,-1253,-901,-644,-398,5,479,920,1197,1343,1274,1186,1071,1024,1061,1090,1130,1163,1184,1141,1022,754,410,94,-47,-87,137,299,369,407,390,413,525,717,888,990,1075,1202,1307,1318,1143,834,391,23,-198,-413,-665,-964,-1216,-1484,-1827,-2022,-2219,-2389,-2382,-2316,-2102,-1847,-1559,-1241,-967,-612,-124,406,900,1244,1734,2166,2478,2859,3175,3448,3711,3876,4111,4289,4453,4553,4583,4586,4475,4300,4081,3671,3271,2896,2533,2086,1727,1498,1194,889,591,323,119,-190,-510,-758,-1043,-1300,-1586,-1707,-1824,-1960,-1912,-1832,-1731,-1580,-1465,-1437,-1465,-1422,-1322,-1244,-1184,-1202,-1253,-1251,-1284,-1240,-1213,-1123,-1039,-1074,-1089,-1119,-1173,-1231,-1357,-1476,-1650,-1848,-1899,-1918,-1902,-1970,-2099,-2048,-1962,-1771,-1435,-1220,-1008,-846,-717,-548,-411,-114,130,286,375,361,362,332,229,166,84,10,-101,-281,-449,-619,-699,-820,-973,-981,-1075,-1005,-1146,-1325,-1473,-1577,-1580,-1563,-1427,-1315,-1126,-849,-548,-230,135,337,539,842,1367,1865,2100,2338,2634,2787,2819,3080,3203,3396,3241,3235,3456,3294,3404,3246,3020,3024,2739,2526,2603,2210,2083,1868,1312,1329,536,389,180,-472,-281,-697,-921,-829,-1363,-821,-1045,-1200,-530,-1053,-654,-515,-703,-36,-319,-95,208,-40,347,622,413,1073,192,773,691,224,683,155,50,-136,-767,-444,-726,-1223,-1152,-1539,-1851,-1828,-2593,-1912,-2297,-2387,-1958,-2553,-1860,-2203,-1688,-1742,-1445,-1706,-830,-935,-709,-35,-1066,456,-359,353,436,-72,1214,-602,815,763,-637,555,-1228,281,-1142,-1022,-1323,-1601,-1056,-1998,-1261,-2166,-1133,-1871,-563,-1125,-1436,226,-1464,1006,-901,460,-165,-502,1723,-603,2398,-273,1706,1278,1612,2094,707,3004,1557,2882,2332,2038,2798,1458,3131,1651,1690,1703,904,1530,144,1600,-1050,822,-439,54,-308,-1243,395,-1573,342,-1056,-1004,-649,-1975,-159,-1240,-285,-510,-492,-58,-253,935,-369,1271,264,1906,490,1752,1818,1036,2765,1059,2273,1577,1324,1618,1283,1066,575,482,623,-345,198,-746,-1215,-575,-1536,-1053,-1760,-996,-2106,-1873,-871,-1989,-2082,-1376,-1693,-1345,-2179,-1020,-612,-1805,381,-1351,-84,-765,-382,800,-854,363,67,-798,729,-668,23,171,-1243,689,-1078,-1060,-238,-1321,-175,-2109,-609,-543,-1729,636,-1289,-380,-870,-467,278,-728,573,-736,366,485,681,916,799,1114,888,1744,1333,525,2622,1028,588,2424,501,1587,1866,408,952,835,-469,1325,-517,40,62,-827,64,-989,217,-514,13,-462,-1845,403,-1597,268,-723,-941,620,-1516,1223,-14,-556,778,-224,969,386,1372,67,2044,1119,414,1378,778,811,118,1197,879,-114,835,242,89,212,-335,9,-245,-100,-573,-139,-251,-420,-812,307,-998,-645,25,-957,501,-1243,616,-1637,844,-355,-1148,599,-2405,557,-1026,-84,-706,-476,80,-1972,799,-1130,-966,-202,-814,177,-883,-223,-1367,908,-782,-299,-749,-400,-112,-444,-112,-839,48,221,-702,1066,-662,900,48,-447,1674,-1019,2105,-1193,682,338,436,1789,-727,1899,-569,1545,64,226,759,-272,1228,12,394,-254,464,-174,305,-77,-979,543,-397,635,-1465,293,-182,-492,444,-350,-86,-212,-554,151,-453,98,100,-15,222,233,281,479,826,690,797,493,717,359,711,1154,187,347,608,507,177,120,-20,1029,-249,155,-597,973,279,-627,403,-962,407,-576,155,336,-1542,1608,-1389,474,165,-840,377,-350,818,-1096,773,-1394,649,-1120,218,-669,-737,-827,-744,290,-2185,683,-1877,-1089,-53,-1584,17,-1285,-623,-641,-758,612,-984,-64,-489,133,234,-164,616,-51,1131,564,555,613,592,1346,133,998,589,753,638,546,162,-32,666,-249,463,-818,590,-745,-274,-133,-352,-650,-731,255,-933,-412,-97,-194,-628,-495,1388,-999,29,-133,1256,-1071,666,272,542,1,738,450,-651,1310,-578,1188,-241,1239,-13,689,192,149,716,113,223,366,-92,502,87,-288,1066,-1185,442,37,-443,151,-763,1831,-1307,343,276,-793,605,-20,370,227,105,717,157,221,287,279,813,-534,396,875,-695,455,-15,269,-523,79,-195,-1058,90,-1168,-494,-442,-1274,-931,-499,-1289,-366,-854,-1421,-117,-700,-215,-936,-335,236,-439,1083,-371,1249,-217,674,854,298,743,440,1073,151,177,1595,252,-5,175,252,990,-1009,683,-796,-94,-536,-606,-355,-1463,-654,-1021,-203,-1918,-117,-813,-541,-989,457,-1334,430,-307,-706,836,163,-507,356,1499,-233,782,522,1203,121,966,874,234,878,194,574,-137,691,182,-1125,508,210,-789,242,-482,-304,-362,80,-508,-311,-494,-234,492,-1036,981,-340,279,376,824,-80,697,989,496,1050,799,1310,748,550,1852,-2,982,1438,-72,857,-640,790,-948,125,-1314,46,-984,-923,-756,-1237,-970,-1566,-347,-1847,-612,-1137,-558,-1163,-85,-1213,58,-308,248,-272,620,-585,1486,917,-350,1317,-311,1046,379,1133,390,179,1157,89,329,604,-504,438,-922,1621,-1978,340,-1509,-783,-52,-1813,-24,-1857,37,-1736,210,-1268,-471,-809,604,-1854,-145,379,9,52,240,442,157,1062,174,874,188,1286,380,863,338,647,772,160,489,545,751,-605,1257,-274,-1065,575,-446,-197,-864,311,-1022,324,-690,253,-869,256,200,-463,595,-515,935,-29,610,510,52,1401,259,1180,541,939,650,782,1318,-116,1496,-342,1629,-414,678,-112,370,-559,-807,362,-1336,205,-1566,-128,-1814,348,-1961,5,-2062,596,-2032,421,-1709,747,-1124,296,-755,-34,353,-649,1421,-1233,1017,258,774,-125,761,770,57,600,781,-484,81,608,243,-940,1056,-586,-58,-249,-244,-494,-1298,560,-1406,-228,-554,243,-1934,689,-1318,200,-877,1280,-2370,702,-497,644,-284,116,346,-376,2035,-799,1247,-697,1470,-238,876,-669,1031,430,-174,88,719,287,-558,970,-397,1105,-974,974,-295,-104,211,-97,-266,315,-179,362,-135,-287,658,-425,866,-558,353,-60,606,-172,788,-265,918,-317,897,-395,1459,-614,531,666,-201,635,542,-339,97,1090,-1083,1157,-398,61,-1633,483,-516,-428,-485,-580,-714,-445,-197,-758,-1167,-9,28,-1192,607,-563,-327,-745,1033,-1228,16,225,358,-565,780,173,-485,-28,1427,-113,217,-335,1203,262,-522,1232,-1272,472,-78,187,-1368,945,-583,-473,-264,-490,30,-709,336,-399,-255,-367,169,-623,-817,-257,1259,-1376,180,-90,-766,-16,19,199,-1290,662,38,-149,-420,912,161,-211,883,-1165,1033,-510,941,273,-240,980,-289,743,-115,854,376,-469,546,386,548,-340,1014,16,-442,1919,-345,730,-26,182,212,321,129,-302,21,-74,313,-150,-630,507,-525,527,-523,141,-70,532,-630,189,273,-1191,2692,-1234,256,-239,215,-160,-349,607,-1547,14,-348,-79,-548,-416,463,-1032,317,-253,-250,112,-185,448,-991,-207,1142,-1021,247,249,-717,-258,219,562,-682,562,77,-359,-29,160,832,-805,-253,543,12,-289,759,-87,-579,627,539,-386,-103,943,-322,714,127,539,-487,364,932,-2006,376,514,-937,-400,7,-809,-449,-124,-150,-882,-238,-198,206,-1150,1615,-619,-283,10,506,859,-1302,1078,581,-261,279,1027,-695,-369,2126,-149,-840,1090,255,435,-392,632,-461,-79,742,-331,-412,-799,2029,-1424,574,-759,1151,-464,154,81,141,-505,554,233,-167,607,41,138,-272,1391,-558,731,-237,1254,-296,34,697,-1487,624,0,579,-1645,367,165,-361,-913,279,-819,-110,-669,-173,-130,-552,-78,-659,562,-507,186,60,-209,89,-128,112,-137,175,48,-743,601,-218,415,-532,229,704,-60,941,-715,696,-106,461,-325,174,-454,1842,-918,432,120,-303,-445,244,-270,-1021,866,-1160,-77,-955,129,-947,207,-723,16,-888,491,-128,-1227,728,-601,457,-539,736,68,-401,1741,-185,293,904,76,1139,-939,1379,-1312,1040,-390,72,345,-102,332,-255,237,224,-648,-46,389,-404,499,-1167,1835,-1655,631,-691,315,-106,-484,813,-370,208,-36,177,124,161,202,494,-323,1012,-737,907,173,-138,243,249,323,-772,803,-306,-564,611,-351,-511,300,-816,142,-955,776,-1257,58,684,-1117,1213,-299,159,7,-759,1489,-706,347,-133,-32,98,85,257,0,206,-216,24,453,222,19,139,106,258,-589,472,230,-378,160,38,-452,7,-679,-52,-101,-512,387,-1118,1469,-1363,1069,-887,467,-130,-249,624,-452,867,-723,399,-455,1140,-442,175,-20,158,162,-171,457,-385,408,-178,-389,1708,-777,623,-456,1070,-181,-42,210,23,198,-513,-211,711,-1071,566,-562,-25,-664,230,250,-1918,1322,-716,352,78,142,574,-392,978,-506,603,391,268,174,207,207,328,170,-92,969,-931,1228,-591,351,-381,-624,323,-830,100,-1335,127,-728,-124,-746,-570,225,-227,-262,-276,-27,325,-388,156,405,156,898,-811,939,-400,896,184,-16,1024,-15,1066,-351,384,112,70,295,-280,-474,-484,184,-1016,966,-2948,983,-691,-68,-132,-697,211,-1184,1309,-1476,217,-176,-769,367,-286,242,-296,97,612,-408,385,-81,309,393,-853,603,-687,1179,-672,163,938,-775,924,-87,-201,-594,1653,-1118,-255,322,-963,233,-20,55,-623,605,-115,-498,120,0,-144,305,-11,1352,-1205,721,-481,258,981,-1470,1718,-1040,412,457,-46,1145,-437,858,-54,1085,-413,332,179,-763,251,-60,413,-1207,598,-1439,625,-963,-1364,508,-834,399,-628,363,-517,180,-114,-418,693,-358,873,14,480,-24,-208,807,-272,985,-880,776,553,109,892,-379,666,73,-519,122,503,-78,-1337,508,-828,82,-183,-795,-492,32,-8,-884,483,-1217,1342,-298,-294,373,-414,160,-301,242,-463,444,303,-205,305,-947,565,-245,-92,535,-692,625,38,-217,-113,292,-545,1568,186,-87,440,-1308,724,-1302,639,-499,-799,1319,-1257,405,-284,80,-391,-944,896,-148,440,-1035,249,552,83,458,-596,395,-252,106,390,158,353,629,-29,-74,401,119,-277,819,846,318,-390,-259,-143,-560,750,-205,11,-105,-320,212,-1002,-276,-825,-391,379,-97,72,-96,-47,238,-77,208,172,-410,-54,1561,232,-200,481,79,180,18,618,-500,388,519,-266,455,150,-120,-515,497,-152,-90,-253,-135,-97,-1202,316,-1058,-148,-261,-701,749,-386,853,-385,173,109,-1171,779,363,-127,-393,546,332,-570,613,-864,-236,1017,-898,1011,-307,-432,260,-698,1045,-706,-592,10,-239,-201,66,-928,360,-592,-492,218,-450,-320,-24,7,792,462,314,-358,83,1075,-453,602,765,836,-367,746,83,104,777,-547,193,-410,-593,-286,-520,770,-181,-234,409,-845,-697,-947,589,435,-39,268,-409,-584,-133,-934,-231,1015,-298,885,901,-72,-316,230,-455,300,578,698,248,724,-440,-258,-337,-125,34,-391,399,541,132,273,-22,374,-767,-594,545,-190,640,-385,376,-467,-72,-886,-546,219,-751,821,193,87,-646,-322,-678,-1067,337,754,709,88,28,206,221,-151,-972,907,-129,-355,-73,-316,526,-570,-219,-328,61,703,116,-218,775,895,25,-706,-718,-1245,-798,-825,-702,290,-1117,250,720,-137,176,407,1319,875,834,908,250,967,-390,-11,748,-1081,629,-260,390,-112,-44,-526,-481,-663,-331,-549,-182,943,-29,548,-633,576,-149,-433,-800,270,5,-414,1475,-360,8,22,-895,806,-242,1127,896,720,558,-154,479,-865,90,267,-354,1305,-28,-90,-222,-571,-1087,-368,560,-540,819,753,713,330,-250,-512,-1334,130,-1049,38,781,301,832,-264,-583,-887,84,-1031,264,-116,687,807,0,-164,-1076,97,71,891,1205,206,119,-595,-1234,-498,-817,-589,-426,-709,631,189,101,1137,-441,18,-280,29,294,-601,-277,-556,-743,-113,-516,-346,266,196,1025,691,173,-636,589,-915,1291,-255,646,-1068,495,660,1103,733,-9,1066,-773,743,-957,374,-1494,-689,-406,-731,-442,-570,-701,-182,1634,664,1191,300,-951,-633,-687,-217,426,-732,-180,-309,569,209,-890,-189,148,373,784,982,1458,412,718,625,734,98,-173,-29,-92,-147,-267,-919,-1175,-1614,-971,-570,321,295,243,438,259,1056,31,377,-23,318,402,-282,391,-1501,-212,-893,635,694,937,2003,899,1550,216,-140,104,-1107,-998,-1492,-612,-745,-1604,-156,-816,-789,-577,-711,-463,-483,-413,-340,-152,-369,-201,-670,1017,419,1176,1799,419,969,-113,422,409,222,40,-277,1324,800,45,-204,402,13,447,38,387,-221,-514,-1321,-855,-771,-1709,-694,-601,-277,-103,194,-213,830,138,244,1335,470,376,-30,-370,-160,-595,195,396,-199,270,-249,348,1243,112,875,448,-42,498,435,-109,-188,-264,-399,366,286,292,172,375,-178,442,-2,-74,-81,96,247,-286,-311,-681,-202,-413,256,-535,-155,-922,-898,-608,-940,-340,-443,496,-144,925,-524,222,514,228,905,330,1127,321,642,309,419,225,810,261,339,116,7,356,-144,-593,-869,-410,-711,-465,-1185,-1162,-1262,-1755,-1171,-1489,-907,-1526,-826,-748,-340,-24,-93,412,621,118,1126,728,1355,1444,1060,1631,1069,1077,1214,1021,963,723,486,1082,742,320,450,-279,-6,-609,-597,-706,-1168,-858,-1184,-436,-1061,-797,-747,-792,-455,-644,-251,-452,229,-417,-160,-163,-34,232,-166,589,334,313,242,501,626,546,255,279,538,473,535,196,528,198,185,451,515,552,361,199,218,373,-300,-134,-192,-838,-625,-286,-319,-302,-333,-719,-284,-45,-262,79,-442,100,-254,152,132,-237,-504,55,-147,990,299,541,449,24,437,362,0,-12,272,-512,83,-702,-420,-661,-580,-553,-358,-429,-519,-582,-696,-1075,-940,-849,-975,-577,-327,-260,-182,68,-143,778,257,779,1102,1169,1468,1451,1593,1553,1344,1211,1431,1200,1648,1016,865,894,164,294,175,-295,-704,-857,-1352,-1358,-1284,-1637,-1643,-1545,-1694,-1388,-1051,-935,-815,-747,-696,-487,-424,131,-297,455,458,734,1049,853,938,1089,977,983,1269,1053,1277,886,737,443,-110,114,-335,-65,-591,-343,-646,-190,-991,-432,-797,-493,-871,-279,-134,-244,22,-714,-79,-771,-127,-385,-589,-231,-579,-200,-216,-147,-521,-237,-573,-129,-54,-168,243,-189,60,-156,7,135,80,620,223,564,253,836,169,820,201,629,884,705,851,573,605,400,582,372,510,619,538,276,399,247,-6,-76,105,-244,317,-37,-68,-354,-541,-472,-581,-74,75,446,190,-87,8,-128,-353,253,207,398,644,399,472,496,575,184,480,694,736,779,677,441,582,182,380,208,518,-11,233,-312,-227,-581,-867,-1076,-1043,-989,-1258,-737,-1176,-1086,-1437,-1273,-1226,-1393,-1045,-1440,-1158,-1650,-1537,-1599,-1467,-1559,-1541,-1591,-1210,-1480,-1424,-1673,-1650,-1971,-1798,-1864,-1781,-1885,-2409,-2690,-2714,-2738,-2703,-2230,-1933,-1350,-1494,-819,-687,-259,251,761,1811,2455,2658,3123,3394,3288,3557,3810,4126,4938,5016,5415,5498,5719,5199,5104,5221,5043,5365,5182,5025,5090,4677,4153,3803,3580,3201,3414,3415,3391,2946,2610,1577,1000,404,6,-375,-717,-1225,-1728,-2539,-3412,-4080,-4845,-5576,-5901,-6079,-6460,-6670,-6934,-7334,-7484,-7634,-7486,-7063,-6543,-5810,-5028,-4520,-4006,-3479,-2805,-2207,-1275,-313,716,1663,2233,2771,3159,3510,3825,3925,4463,4716,4583,4484,4085,3470,3391,2712,2479,1914,1366,799,28,-699,-1347,-1833,-2462,-2897,-3144,-3459,-3442,-3911,-3982,-4259,-4373,-4270,-4005,-3790,-3321,-3104,-2792,-2664,-2133,-1691,-1122,-733,-7,353,703,736,842,814,881,989,761,702,321,293,-156,144,94,373,782,903,1199,1615,1698,2234,3300,3904,4947,5764,6617,7258,7976,8769,9640,10630,11266,12037,12456,12524,12178,11553,10767,9817,8999,7799,6391,4542,2821,839,-1349,-3916,-5561,-7204,-9287,-10596,-12226,-13261,-14704,-15513,-16153,-16304,-16112,-15697,-14963,-14381,-13052,-11836,-10534,-9141,-7395,-5254,-3736,-1953,123,2071,3544,5009,6322,7781,8442,9375,9886,10419,10244,10067,9563,8868,7947,6918,5905,4478,3266,1844,787,-805,-2262,-3459,-4480,-5349,-6098,-6698,-6933,-7419,-7348,-7318,-6917,-6397,-5732,-4916,-4259,-3265,-2358,-1467,-976,-74,494,1297,1671,2419,2751,3020,3238,3242,3357,3222,3251,2784,2325,1688,1063,571,-390,-1249,-1898,-2638,-3122,-3546,-3661,-3638,-3745,-3388,-3254,-2640,-2062,-1190,-415,204,1245,2186,3194,3975,5100,6218,7334,8344,9641,10805,11930,12477,13250,13762,14206,14093,13911,13223,12384,11418,10085,8347,6379,4604,2550,148,-2253,-4259,-6324,-8612,-10557,-12155,-13501,-14786,-15807,-16394,-16685,-16899,-16620,-16046,-15458,-14400,-13014,-11801,-10289,-8541,-6524,-4799,-3079,-1030,1081,2820,4320,6042,7457,8637,9288,9786,10131,10132,10024,9461,8892,7801,6895,5671,4203,2640,1246,106,-1476,-2656,-3792,-4608,-5576,-6412,-6952,-7454,-7584,-7525,-7262,-6834,-6254,-5555,-4990,-4238,-3298,-2215,-1372,-516,517,1371,2097,2542,3103,3389,3568,3604,3791,3769,3524,3321,2751,2317,1531,1041,392,-446,-1193,-1923,-2247,-2885,-3268,-3548,-3708,-3771,-3410,-3117,-2685,-2086,-1497,-781,-39,1309,2740,4080,5256,6582,7992,9399,10787,12409,13834,14569,15381,15885,16228,16127,15581,14806,13500,11989,10603,8889,6613,3782,1405,-973,-3677,-6200,-8257,-10345,-12658,-14737,-16221,-17249,-18155,-18735,-18921,-18910,-18462,-17491,-16467,-15285,-13674,-11930,-10108,-8149,-5608,-3056,-1164,669,2672,4776,6570,8020,9529,10451,11066,11303,11488,11263,10700,9879,8777,7511,6105,4907,3452,1672,-333,-1763,-3116,-4338,-5454,-6236,-7002,-7838,-8292,-8575,-8579,-8401,-8014,-7463,-6764,-5700,-4528,-3466,-2447,-1409,-163,935,2013,3166,3996,4419,4752,5033,5199,5329,5231,4983,4650,4296,3901,2954,1761,695,-296,-1137,-1849,-2452,-2961,-3801,-4381,-4702,-4795,-4551,-4389,-3845,-3222,-2153,-1041,-193,620,1438,2449,3876,5432,6917,8674,9949,10948,11867,12882,13929,14621,15270,15530,15421,15108,14426,13173,11338,9710,8092,5961,3885,1957,-237,-3146,-6146,-8419,-10285,-12093,-13706,-14947,-16007,-17033,-17673,-17924,-17821,-17493,-16772,-15844,-14667,-12867,-11108,-9374,-7924,-6333,-4242,-1869,95,1946,3949,5424,6549,7472,8480,9389,9817,10033,9911,9497,9106,8367,7311,6000,4732,3615,2193,825,-273,-1430,-2775,-4052,-4959,-5708,-6451,-7026,-7301,-7411,-7258,-6939,-6542,-6049,-5429,-4645,-3713,-2822,-1739,-525,549,1363,1998,2693,3212,3658,4045,4446,4617,4590,4414,3977,3361,2829,2202,1418,652,-38,-618,-1336,-2108,-2831,-3568,-4166,-4336,-4256,-3949,-3595,-3316,-3021,-2643,-1896,-906,1,1073,2403,3766,5215,6421,7616,8740,10010,11166,12429,13917,15009,15580,15804,15679,15266,14851,14173,13053,11408,9816,8120,5867,3442,1212,-1166,-3982,-6591,-8464,-10055,-11900,-13748,-15259,-16518,-17509,-17904,-17926,-17823,-17478,-16932,-15943,-14772,-13388,-11662,-9899,-8403,-6667,-4371,-1963,-26,1662,3499,5118,6510,7832,9126,9885,10153,10119,9962,9696,9266,8626,7371,5955,4719,3615,2347,972,-193,-1461,-2702,-3733,-4514,-5219,-6079,-6862,-7297,-7405,-7104,-6636,-6212,-5920,-5509,-4752,-3704,-2734,-1711,-698,215,1019,1813,2651,3220,3462,3525,3725,3835,3909,3850,3381,2728,2137,1606,1107,566,-6,-651,-1503,-2121,-2553,-2919,-3257,-3531,-3535,-3294,-2750,-2130,-1775,-1535,-1086,-315,1098,2503,3814,4771,5273,5741,6440,7511,8661,9624,10472,11196,11858,12394,12784,12879,12522,12200,12027,11678,11080,10146,8782,6672,4469,2850,1348,-467,-2586,-4514,-6456,-8512,-10295,-11519,-12744,-13931,-14869,-15371,-15392,-15318,-15185,-15019,-14761,-14119,-12870,-11204,-9760,-8520,-7152,-5774,-4416,-2821,-832,1074,2538,3770,5157,6380,7277,7926,8337,8443,8430,8388,8162,7692,6976,6033,4635,3365,2471,1776,992,-71,-1127,-2194,-3425,-4375,-5060,-5504,-5805,-5947,-6095,-6013,-5885,-5775,-5503,-5192,-4582,-3583,-2525,-1707,-1094,-461,1,489,1137,1942,2602,2960,3176,3328,3320,3184,2972,2755,2477,2201,1962,1407,721,-18,-656,-1252,-1609,-1747,-1787,-1875,-1994,-2136,-2058,-1817,-1318,-662,-43,604,1350,2039,2642,3324,4184,5103,5961,6910,8026,9112,9991,10703,11259,11463,11726,12079,12402,12480,12134,11604,10502,9092,7902,6680,5012,3078,1329,-401,-2519,-4755,-6528,-8309,-10249,-11951,-13283,-14014,-14667,-15340,-15793,-15889,-15759,-15205,-14374,-13535,-12564,-11255,-9781,-8398,-6857,-5091,-3317,-1767,-292,1479,3140,4294,5316,6253,7030,7631,8199,8476,8419,8034,7469,6820,6078,5435,4614,3469,2208,1184,328,-648,-1644,-2704,-3566,-4261,-4866,-5258,-5416,-5533,-5689,-5682,-5568,-5175,-4486,-3802,-3189,-2614,-1866,-1054,-356,337,1125,1700,2093,2455,2918,3230,3283,3178,2959,2651,2436,2272,2011,1546,962,369,-252,-716,-1037,-1329,-1710,-2026,-2215,-2356,-2414,-2371,-2259,-2004,-1518,-819,-180,339,903,1409,1900,2523,3386,4329,4979,5539,5973,6314,6691,7102,7722,8353,8688,8988,9234,9264,9177,9054,8828,8439,7982,7388,6731,5697,4377,3167,1912,462,-961,-2144,-3233,-4605,-6020,-7129,-8159,-9105,-9859,-10252,-10560,-10755,-10842,-10850,-10708,-10391,-9868,-9368,-8745,-7880,-6904,-6131,-5312,-4310,-3314,-2518,-1659,-533,539,1432,1985,2506,2916,3211,3405,3565,3627,3525,3328,3101,2740,2197,1702,1236,830,520,352,71,-337,-936,-1449,-1786,-1938,-1879,-1827,-1817,-1810,-1908,-1964,-1897,-1722,-1410,-1178,-810,-337,47,318,427,535,578,729,973,1173,1284,1167,906,661,382,90,-94,-301,-542,-707,-858,-956,-1137,-1458,-1659,-1692,-1492,-1137,-815,-509,-169,178,590,1087,1710,2390,2929,3550,4332,5150,5797,6281,6588,6802,7094,7407,7759,7888,7689,7328,6863,6496,6190,5896,5377,4368,3252,2365,1529,680,-138,-822,-1495,-2301,-2878,-3228,-3580,-4017,-4394,-4474,-4334,-4053,-3834,-3718,-3724,-3741,-3605,-3335,-3004,-2716,-2573,-2493,-2337,-2157,-2003,-1974,-1982,-2055,-2001,-1824,-1712,-1699,-1979,-2280,-2522,-2585,-2514,-2546,-2694,-2939,-3237,-3400,-3371,-3284,-3135,-2990,-2849,-2581,-2160,-1672,-1260,-831,-289,439,1098,1641,2043,2167,2231,2318,2539,2858,3014,2988,2638,2209,1837,1512,1186,849,567,305,48,-363,-806,-1244,-1758,-2193,-2418,-2414,-2391,-2458,-2614,-2779,-2960,-3041,-2886,-2569,-2156,-1689,-1269,-879,-536,-218,146,538,1051,1793,2587,3127,3449,3583,3612,3667,3822,4103,4495,4772,4895,4870,4644,4248,3839,3645,3688,3760,3648,3459,3006,2427,1942,1452,1080,905,741,438,116,-316,-733,-1106,-1349,-1240,-1136,-1083,-934,-718,-620,-422,-72,370,703,949,1171,1460,1728,1889,1999,1904,1706,1530,1465,1410,1340,1040,611,40,-477,-791,-1065,-1423,-1879,-2349,-2819,-3265,-3723,-4110,-4465,-4788,-4978,-5079,-5158,-5199,-5291,-5379,-5321,-5003,-4559,-4133,-3734,-3337,-2878,-2430,-1897,-1220,-603,-152,134,476,913,1284,1485,1510,1465,1404,1390,1470,1582,1509,1338,1045,712,424,175,-21,-304,-515,-663,-817,-982,-1221,-1429,-1655,-1719,-1499,-1239,-1018,-805,-689,-581,-452,-140,426,889,1277,1665,2074,2428,2600,2808,3006,3201,3297,3259,3222,3072,2816,2396,2045,1915,1809,1598,1348,1102,700,355,16,-107,-184,-224,-158,-65,-9,-5,18,166,321,528,806,1176,1653,1835,1863,2046,2194,2259,2364,2623,2814,2829,2747,2580,2332,1919,1497,1281,1022,565,254,-71,-675,-1363,-2056,-2618,-2940,-3116,-3191,-3117,-3246,-3561,-3682,-3506,-3180,-2863,-2426,-1929,-1489,-1228,-1124,-824,-432,-206,77,446,693,700,778,812,710,662,600,578,548,393,245,56,-375,-775,-965,-1247,-1552,-1783,-2039,-2237,-2413,-2659,-2852,-2858,-2840,-2738,-2649,-2471,-2087,-1809,-1582,-1357,-706,-260,38,463,816,1119,1214,1398,1766,1951,1849,1816,1771,1626,1619,1416,1587,1698,1545,1175,848,531,70,-254,-316,-184,-147,-307,-679,-675,-931,-1031,-961,-391,-369,-118,-69,143,135,106,-98,355,992,1119,1786,1853,1940,1798,1676,1506,2053,1949,1926,2034,2286,1710,1746,1571,1415,1100,1188,1039,1634,1674,980,877,588,187,-108,252,-190,-144,-261,-347,-549,-558,-1454,-1435,-1222,-1107,-1422,-1047,-1492,-1810,-1547,-1635,-1095,-1284,-1162,-1259,-301,-607,-552,-423,-158,-438,-252,147,93,108,83,13,622,421,144,102,37,-143,-179,-317,-469,-526,-807,-999,-1109,-851,-1289,-1340,-1267,-1404,-1647,-1368,-1169,-615,-337,-469,-521,-515,-334,-381,193,330,513,630,619,165,775,402,384,845,1230,1313,1174,732,365,525,677,381,858,956,307,10,-249,-666,-730,-721,-1210,-873,-724,-856,-444,-157,-353,-371,-298,43,799,894,1051,1092,1326,866,777,1431,1076,1064,1250,1110,1292,1411,879,711,865,218,433,611,863,358,-20,37,-892,282,-659,-588,-1098,-518,-1459,-780,-806,-1443,-1478,-2269,-1381,-2030,-365,-977,77,-1011,-257,-371,517,334,885,490,1115,1568,1303,1068,1126,1148,432,1099,1096,895,344,101,178,48,32,-197,-656,-770,-1430,-472,-633,225,-1782,-1429,-1830,-871,-1562,-1380,-658,-898,-1635,-1318,-496,230,-16,632,451,871,308,240,1758,1554,1325,848,1645,942,-17,1037,609,927,26,9,873,368,-526,-447,444,274,-227,-207,-71,-45,-139,-384,-680,-136,-1975,-1203,-226,307,-160,-1095,-63,-924,-305,-439,172,1274,243,1530,-446,1010,-514,-185,783,1318,1246,770,834,276,541,-369,518,1140,308,759,-615,567,-1032,-425,132,-1437,673,-1793,-147,-1121,-182,-1093,-1572,-90,-1668,-539,-988,-16,-726,-191,-391,-900,80,-1120,-309,-60,5,812,-1221,651,513,260,-298,1065,1150,558,609,74,1405,-95,892,697,437,195,-485,-64,106,-453,-760,31,-991,-565,-263,-2060,487,-998,-627,359,-884,-118,-607,-44,-259,-1074,543,-317,-130,74,125,487,223,-23,1469,-216,1020,820,955,837,673,1386,347,922,1113,259,100,89,308,-204,-397,345,-1149,1036,-1713,40,-345,-1494,12,-669,-836,300,-1036,167,321,-1541,879,-205,476,797,-41,1843,9,1044,818,1059,2527,1041,632,1717,162,225,486,573,604,-593,-710,-479,-1090,-1594,-1233,-1848,388,-2026,-1395,-512,-1565,-931,-1443,-1783,-27,-628,-814,257,-991,176,-103,-797,1541,-212,693,1257,572,1859,-916,2547,-288,1559,1189,670,1692,-880,655,519,880,-839,258,784,-458,309,-1492,350,-918,141,-888,-1067,-426,-1138,-731,-1716,-358,-1205,-1088,-84,-576,-839,-365,-33,-791,272,241,-512,1909,-598,1333,446,1179,1103,232,1549,503,1770,1078,1016,961,392,715,639,444,-417,77,51,-441,-468,-882,-103,-790,-941,-872,1022,-1984,88,-236,-1276,388,-1664,608,-895,761,311,-2494,2250,-622,1122,66,851,1514,-98,2100,819,567,1332,0,1558,-376,1654,-330,-551,1132,-1074,227,-503,-116,-987,-1111,824,-1750,-693,-1127,-1328,-529,-1806,-568,-671,-1061,-931,-771,-320,-359,-420,-483,987,-810,398,-31,-201,1390,-388,1535,-516,1237,631,36,2153,-334,1511,-634,1670,28,-187,769,-414,1015,-1446,671,-765,417,-641,-777,275,-3142,546,-1408,-725,-1290,-901,-576,-145,-287,-1074,-155,342,-1471,444,451,-24,1224,306,686,-134,2398,-315,1908,738,482,1938,296,859,29,2316,-247,133,406,182,65,-363,-648,460,-699,-884,-185,-1111,-835,174,-810,-1065,-88,-317,-408,543,-93,421,-8,719,1331,-12,1040,1191,837,605,443,2880,331,264,936,1808,-284,650,568,316,-1695,181,-19,-1078,-1091,-1253,-268,-2106,-1653,-790,-1594,-1433,-2358,-408,-1506,-744,-889,-795,-330,-388,-185,4,884,341,673,256,1537,666,1296,988,1213,1606,1045,999,1453,893,812,312,782,343,-189,241,-225,-809,-757,-437,-1760,-707,-1230,-3035,-289,-2259,-1027,-1628,-1630,-937,-2141,1690,-2457,228,-335,-1307,885,-51,506,-102,1256,501,1725,-158,1888,1194,1265,1133,1399,1246,1756,585,1766,534,580,674,-44,509,-139,315,-777,-110,-492,-1316,1255,-1992,-86,-1129,-76,-1066,-442,-634,-650,-41,-655,211,7,-28,319,55,968,223,490,303,1249,1144,0,1005,1026,125,842,-398,1705,-614,264,459,-326,402,-462,-304,-103,-710,-734,-560,-338,-1394,-442,-1172,0,-2271,-114,-1136,-790,123,-793,-416,-238,-645,187,-155,422,-348,1002,-52,1103,-297,1005,378,1161,433,634,869,818,276,1323,-385,1010,-314,-175,521,-433,18,-389,-688,-288,-1080,-400,-940,-857,-893,-1248,-842,-975,-1091,-786,-757,-695,-382,-1006,-145,-141,-229,-139,466,-181,790,408,379,961,216,1290,494,778,940,611,1245,287,1089,-9,1499,357,80,433,275,333,63,38,-15,344,-663,17,118,-508,70,-535,-337,296,-566,-482,461,-185,-311,121,412,-33,369,-120,502,482,-29,532,82,490,614,-353,685,-128,27,216,-83,-713,513,-757,140,-949,-175,-609,-370,-536,-755,31,-752,-461,-770,-79,-637,-509,-203,-415,457,-968,126,401,-102,644,84,358,1044,-400,684,781,394,638,-231,610,350,118,602,-533,714,-662,-240,4,-613,-118,-555,-980,190,-1073,-189,-668,-436,-444,-1055,-104,-615,228,-1545,659,-431,-144,-73,-87,368,316,-416,589,641,200,-1,747,549,408,249,152,789,235,-44,603,419,-135,-3,99,197,-266,-120,221,-330,41,-207,-353,85,-361,-87,-112,-119,136,-274,379,-31,-18,321,97,255,326,113,344,316,388,363,153,427,270,225,425,209,294,117,-593,224,-93,-209,219,-242,-222,-302,-716,61,-592,-19,-486,-488,-109,-540,304,-422,-308,-62,-310,-141,196,-377,482,-193,-116,465,-479,962,-176,165,485,-427,436,28,-251,652,-36,-78,246,-418,50,-250,-94,9,-333,-260,-281,105,-310,-204,-212,-194,-329,-190,-236,-145,-14,-345,26,-141,-284,107,-149,78,64,-122,422,-83,191,412,-85,422,204,7,418,113,17,345,89,186,59,-43,155,-21,80,-142,88,-263,-165,99,-359,240,-401,-238,239,-200,-188,244,-234,235,121,-108,517,-58,430,99,150,526,106,595,265,372,341,308,249,167,124,286,120,-22,178,-223,32,-230,-197,-60,-440,-95,-390,-297,-296,-269,-319,-402,-227,-352,-277,-102,-73,-268,98,-131,-70,199,-118,253,-38,245,171,162,415,145,256,242,151,161,320,115,7,50,-8,-139,174,-328,-4,-508,-154,-64,-642,-78,-743,-396,-459,-469,-98,-585,-186,-309,-406,-48,-412,119,-126,-2,210,36,359,140,226,297,434,276,534,342,360,577,131,579,32,411,371,86,341,-263,216,-42,-158,-127,-258,-176,-182,-149,-443,-111,-365,-333,-17,-383,-6,-78,-162,212,-271,365,-20,57,444,-79,438,254,301,401,24,427,136,196,283,131,127,107,105,-60,81,-147,39,-119,-81,-160,-224,-21,-292,-77,-172,-216,-98,-240,-12,-59,-138,-20,-41,55,-121,249,-1,136,241,-22,198,107,105,36,137,-44,61,-34,101,-189,-48,-7,-251,139,-314,-74,-327,-64,-239,-149,-341,-187,-95,-511,86,-555,-124,-221,-180,-12,-369,97,-158,-58,19,-92,13,65,-50,250,-25,259,153,106,313,23,505,-8,378,-78,256,360,-27,330,-175,211,-27,200,19,-21,105,-73,0,-51,-16,-77,-30,-79,-10,23,-70,-103,79,-105,63,70,18,151,49,33,199,35,192,120,29,314,-125,414,101,-26,152,-153,117,-46,5,-59,-95,-95,-133,-94,-133,-91,-123,-156,-96,-181,-49,-225,-20,-197,-55,241,-256,220,-133,61,275,-96,192,62,-28,302,-33,174,277,-55,349,-37,285,6,207,-62,197,44,34,-38,-246,275,-380,187,-291,-215,-102,-312,120,-392,-140,-368,-107,-321,-173,-274,-433,-57,-391,-83,-243,-181,-44,-175,7,-134,-39,27,63,2,89,91,109,43,219,81,163,225,48,268,91,120,212,-11,141,162,19,212,-65,142,31,22,40,-4,92,-55,54,10,33,15,59,-24,79,53,136,97,20,221,-32,220,36,142,112,110,108,-5,220,-146,302,-80,47,-30,-141,164,-265,99,-161,-167,-74,-95,-124,-56,-198,-120,-15,-159,-76,-103,-17,-12,-28,23,83,41,23,134,-25,296,-5,296,58,2,259,-90,259,79,17,11,-60,17,-37,-47,-173,-58,-162,-54,-220,-130,-84,-314,-32,-304,-163,-54,-263,4,-176,-70,-109,-61,-40,-74,17,-109,79,-119,109,-115,58,-6,4,17,-57,-11,44,14,-112,98,-172,105,-16,-78,83,-204,101,-74,56,-25,26,-12,82,55,-20,128,-23,165,-15,54,145,74,56,152,-9,192,73,-21,257,-46,128,183,-3,230,-92,55,87,0,208,-38,98,37,-99,37,7,-27,50,-39,-22,45,-166,16,-42,-73,12,-151,66,-22,32,-30,81,-85,131,70,-27,198,-76,229,26,105,66,43,127,23,113,-34,141,-7,103,17,-6,45,-82,98,-31,-25,-102,-120,-90,-103,-161,-152,-120,-226,-130,-264,-149,-150,-299,-109,-289,-190,-131,-230,-130,-158,-236,-54,-158,-72,11,-98,16,-13,81,1,106,47,90,122,99,160,76,164,8,52,128,-6,227,27,-7,57,-134,32,-77,-65,-8,-192,-12,-89,-27,-47,-96,-79,25,-67,34,29,4,146,-6,177,93,137,176,174,165,190,209,170,259,181,248,91,222,209,80,222,1,200,60,81,-4,59,-71,-71,44,-146,104,-85,-67,-3,-217,29,-144,-24,-18,-99,-4,-48,-104,53,-74,7,19,-37,66,50,15,82,37,-26,53,-18,7,4,-30,-51,-66,-97,-141,-149,-89,-149,-157,-77,-237,-53,-244,-177,-114,-257,-88,-217,-73,-173,-98,-118,-161,-43,-95,23,-34,9,27,4,109,27,115,107,34,145,45,150,101,49,101,12,119,35,100,15,-40,51,-59,82,-62,-26,-45,-81,-12,-141,-10,-106,11,-28,-50,0,-23,13,-43,32,29,-2,111,34,135,91,53,157,37,187,136,149,200,55,217,48,167,140,78,142,62,87,83,-12,84,-62,24,-13,-45,10,-75,-7,-106,-3,-50,-80,-19,-173,58,-145,45,-59,-74,65,-52,48,19,21,70,11,9,11,-10,12,9,-4,-11,-28,-14,-74,-18,-153,-12,-112,-117,-40,-292,-41,-201,-95,-147,-219,-76,-199,-120,-129,-115,-72,-68,-66,-41,-24,-42,69,0,78,77,-31,113,9,91,154,-16,184,-29,86,88,5,154,-3,80,9,33,-40,-12,-21,-11,-7,-47,17,-36,-47,-21,-78,-4,-17,-9,33,-18,87,6,58,57,44,81,97,99,189,127,159,124,91,126,147,132,151,121,94,98,81,6,79,-2,51,57,-48,63,-70,-32,4,-105,0,-139,-13,-69,-49,-60,-84,-46,-86,-25,-85,-1,-67,-61,24,-42,91,-41,-17,-18,4,0,-30,-8,-28,-5,-38,-69,-48,-77,-39,-51,-67,-101,-42,-102,-110,-102,-142,-44,-110,-74,-15,-120,-22,-87,-88,-26,-75,79,-34,10,36,6,60,29,53,28,95,40,43,56,-20,98,-25,0,25,-59,24,-85,-43,-50,-79,-47,-85,-79,-61,-76,-89,-4,-51,7,11,-4,-1,10,20,25,57,25,75,99,114,99,100,104,58,167,45,119,163,103,165,72,56,111,61,91,39,37,14,58,-13,-2,5,-21,-19,-34,-33,37,-53,28,-70,-33,11,-35,51,-2,21,20,23,17,12,7,18,69,-6,26,6,22,38,-42,43,-32,1,13,-90,3,-96,-40,-60,-38,-43,-86,-94,-125,-73,-105,-74,-95,-145,-90,-109,-48,-81,-84,-42,-78,-5,-18,-6,11,-28,7,-13,-2,56,-13,68,31,21,63,21,30,32,-14,57,57,12,55,-7,0,-26,-61,-63,-5,-13,4,-23,-30,17,-56,-5,-17,23,27,23,56,19,39,43,10,48,-18,36,-15,5,53,-56,15,-3,21,87,60,143,108,121,102,75,78,42,50,19,23,-7,-1,-54,-40,-40,-92,-28,-86,-41,15,-30,65,36,87,77,78,106,68,85,66,11,-5,-51,-88,-77,-67,-99,-75,-110,-74,-56,-60,27,15,57,95,68,119,51,80,58,5,17,-22,-52,-76,-101,-99,-72,-82,-118,-87,-93,-64,-37,-36,-5,-8,-6,-14,-28,28,14,12,31,14,16,37,-9,23,-16,0,44,42,37,33,50,52,80,46,72,66,57,68,9,29,-42,-51,-100,-173,-147,-183,-174,-125,-149,-90,-79,-59,-43,-41,37,62,96,85,111,70,118,78,30,47,-13,31,-38,16,59,80,137,224,297,401,592,623,601,529,317,63,-298,-555,-731,-962,-1037,-1145,-1122,-1006,-870,-709,-492,-252,125,325,509,646,704,849,854,843,750,688,517,471,355,179,43,-70,-154,-176,-146,15,52,256,305,355,429,338,264,91,-11,-311,-504,-589,-778,-838,-877,-770,-733,-540,-233,-247,40,1,391,42,243,167,31,117,57,327,87,315,168,265,315,-61,83,-281,-118,-500,-395,-349,-454,55,-85,322,192,545,419,445,537,483,463,252,277,49,41,-56,-175,-215,-232,-351,-241,-431,-244,-418,-259,-303,-243,0,18,28,311,217,239,279,212,2,-93,17,-58,-105,37,-142,-63,-99,199,-43,380,80,289,207,114,194,130,113,-65,-62,24,-94,72,-218,69,-171,-102,-90,-168,-91,-108,-30,-111,-164,84,-303,277,56,-85,212,-4,-58,-53,-60,-196,-115,-149,-309,42,-421,187,-243,380,-257,422,216,250,86,246,-106,44,-50,133,167,-123,289,12,-13,375,-174,109,-189,-234,-220,-128,353,-459,-167,-22,-149,-32,33,89,-235,575,-6,308,259,-126,137,-137,-230,-240,-371,-255,-474,-193,-199,-248,38,26,186,-134,28,-2,303,-36,211,406,-149,698,401,450,-35,296,317,1,269,-222,-161,-225,-283,-593,-592,-569,-643,-319,-255,0,-395,-91,140,29,345,90,525,370,607,769,406,443,66,46,410,225,-297,-550,-417,-483,-285,-147,-207,-312,-150,-61,184,188,210,41,398,243,115,171,222,-117,-525,-245,-30,87,-325,-52,-76,137,-203,176,536,330,155,178,397,456,-394,-276,-77,-38,-383,-326,232,8,-126,-692,-339,-309,-477,-474,-370,-18,-142,-126,467,921,945,875,954,941,452,-97,-449,-547,-1001,-1077,-1117,-745,-898,-926,-691,-94,319,347,612,1135,1017,407,165,112,-200,-108,40,695,911,681,286,225,-191,-1294,-1395,-1453,-1080,-950,-786,-43,176,227,402,884,1223,946,682,753,746,-66,-360,-363,-373,-771,-816,-335,-354,-568,-471,-83,338,62,198,539,762,500,254,366,57,-372,-342,-263,-150,-544,-493,-272,-306,-366,-238,-58,313,416,790,1273,1495,1199,907,909,411,-40,-545,-729,-996,-1203,-1191,-1067,-946,-951,-876,-382,-143,282,657,1052,1236,986,976,726,697,262,125,139,-110,-176,-392,-437,-321,-698,-608,-498,-212,-28,117,469,338,397,64,79,-64,-220,-492,-541,-372,-501,-416,-322,-53,-71,20,500,754,618,476,528,642,475,228,214,150,-43,-283,-256,-143,-374,-538,-648,-612,-667,-959,-719,-271,-107,-103,283,732,730,619,454,641,508,424,390,568,490,146,-27,-98,-143,-441,-631,-565,-567,-717,-734,-417,-255,-326,-362,-171,-153,-222,-284,-26,479,667,789,840,907,442,-51,-261,140,664,1028,1402,1331,889,-61,-844,-1242,-1564,-1421,-868,-73,244,214,218,-147,-475,-707,-708,-455,-394,-22,156,530,596,700,947,1099,1022,802,807,569,214,-94,-63,-99,-455,-521,-793,-1049,-1333,-1252,-895,-667,-224,82,324,398,280,257,259,361,186,197,344,318,54,125,359,483,557,515,424,196,-147,-215,-351,-180,-197,-142,-39,-49,-173,-369,-328,-447,-618,-801,-764,-750,-721,-407,-196,121,334,406,429,536,373,343,315,537,524,515,628,482,237,-100,-222,-379,-437,-345,-188,-27,68,157,246,257,293,175,157,108,-2,-29,-166,-143,-248,-295,-319,-423,-499,-810,-997,-1053,-856,-668,-337,61,362,569,717,953,1068,1002,936,963,1001,861,734,672,478,82,-359,-665,-793,-995,-1036,-717,-518,-389,-180,-18,66,-47,-101,-39,7,38,168,311,505,490,524,579,545,458,280,274,214,49,58,124,179,103,-17,-39,-225,-281,-451,-641,-716,-840,-815,-703,-596,-608,-597,-491,-531,-520,-543,-326,-99,178,562,919,1146,1143,1093,1080,995,1003,899,933,926,753,500,176,-231,-574,-961,-1151,-1169,-1076,-895,-657,-632,-631,-631,-500,-310,-299,-2,304,420,495,430,179,-67,-309,-322,-140,45,188,275,316,169,29,-101,-175,-234,-102,97,339,456,440,261,-72,-421,-654,-794,-663,-479,-259,-7,163,276,220,103,100,38,108,254,439,580,458,296,110,-274,-583,-675,-645,-487,-305,-95,-23,-145,-429,-618,-558,-462,-269,53,444,819,1144,1391,1595,1742,1767,1882,2043,2186,2173,1986,1693,1186,446,-285,-777,-1180,-1443,-1507,-1371,-1159,-914,-682,-568,-606,-719,-711,-646,-523,-258,-46,105,159,90,-84,-223,-426,-599,-590,-519,-243,93,405,601,759,777,800,742,625,511,340,229,239,115,7,-59,-208,-384,-508,-562,-509,-461,-409,-275,-274,-233,-339,-586,-885,-1223,-1589,-1795,-1958,-2051,-2150,-2253,-2291,-2408,-2425,-2443,-2425,-2396,-2362,-2267,-2161,-2088,-1964,-1831,-1669,-1566,-1440,-1270,-1050,-806,-532,-140,283,607,876,1071,1219,1280,1384,1563,1802,1998,2249,2492,2742,2861,2892,2855,2826,2821,2767,2832,2856,2972,3022,3081,3176,3102,3021,2876,2753,2627,2490,2382,2229,2024,1819,1531,1236,888,624,429,218,157,69,19,-101,-158,-300,-352,-387,-410,-282,-194,33,153,234,289,280,179,192,192,204,207,114,21,-336,-656,-1003,-1417,-1810,-2177,-2407,-2614,-2796,-2953,-3129,-3272,-3440,-3529,-3575,-3537,-3376,-3088,-2753,-2490,-2367,-2196,-2202,-2157,-2151,-2085,-1909,-1753,-1455,-1124,-851,-627,-471,-359,-260,-154,0,246,552,821,1087,1418,1654,1834,1928,2090,2211,2295,2284,2188,1946,1545,1168,709,195,-315,-600,-950,-1293,-1542,-1768,-2014,-2261,-2379,-2420,-2336,-2217,-2080,-2013,-1976,-1977,-2021,-2035,-2017,-2035,-1931,-1778,-1592,-1222,-865,-482,-113,372,1038,1584,2192,2878,3528,4053,4380,4654,4881,4998,5054,5053,5085,5080,5101,5023,4870,4570,4298,4080,3888,3853,3785,3719,3587,3309,3038,2629,2098,1498,1042,653,255,-99,-393,-750,-1328,-1872,-2323,-2674,-2903,-2975,-2937,-2814,-2597,-2382,-2159,-1995,-1863,-1667,-1429,-1134,-807,-419,-117,46,91,46,-122,-368,-545,-788,-902,-966,-1045,-1106,-1295,-1522,-1846,-2252,-2617,-2868,-3008,-3111,-3082,-3026,-2974,-2919,-2962,-3046,-3124,-3173,-3133,-2974,-2798,-2548,-2284,-2049,-1915,-1717,-1566,-1377,-1246,-1056,-756,-393,-61,201,534,749,866,898,942,1004,1050,1202,1452,1772,2070,2341,2660,2911,3037,3127,3183,3181,3116,2953,2706,2246,1796,1294,648,-35,-615,-1160,-1685,-2116,-2383,-2494,-2547,-2485,-2361,-2118,-1877,-1557,-1260,-1005,-752,-501,-282,-147,-15,40,-5,-30,-53,-14,93,263,511,848,1186,1514,1857,2216,2531,2799,3103,3413,3671,3807,3884,3827,3710,3508,3313,2998,2680,2466,2359,2256,2224,2142,2067,1949,1758,1611,1389,1214,1011,837,688,460,163,-193,-581,-1060,-1492,-1739,-1865,-1795,-1617,-1354,-1058,-731,-337,-35,234,515,811,1074,1277,1349,1299,1049,645,191,-468,-1155,-1675,-2191,-2687,-3174,-3539,-3803,-4115,-4389,-4591,-4702,-4738,-4672,-4594,-4426,-4212,-4079,-3965,-3893,-3814,-3750,-3656,-3511,-3255,-2918,-2578,-2251,-1826,-1504,-1204,-970,-754,-438,-114,225,518,897,1190,1444,1661,1862,2026,2200,2366,2575,2814,3025,3217,3441,3561,3623,3661,3664,3604,3510,3433,3338,3221,3079,2809,2383,1811,1272,692,-20,-647,-1127,-1546,-1981,-2303,-2584,-2765,-2956,-3029,-2937,-2781,-2458,-1997,-1494,-1086,-741,-396,-125,65,195,402,630,814,993,1140,1193,1158,1076,961,880,853,893,968,1077,1147,1183,1196,1210,1192,1253,1393,1674,1889,2064,2137,2048,1807,1584,1287,1035,832,766,789,901,1005,1041,989,839,633,497,447,466,521,580,580,490,308,40,-197,-585,-877,-1010,-967,-727,-348,-14,337,725,1024,1273,1459,1631,1746,1798,1839,1817,1695,1348,901,322,-497,-1344,-1994,-2561,-3117,-3565,-3853,-3997,-4101,-4197,-4290,-4354,-4463,-4476,-4478,-4369,-4171,-3945,-3764,-3603,-3359,-3164,-2978,-2855,-2619,-2362,-2074,-1765,-1360,-998,-680,-430,-112,155,387,597,807,1073,1317,1544,1765,1967,2131,2303,2431,2695,2925,3135,3372,3568,3642,3691,3656,3541,3321,3051,2728,2374,1935,1567,1119,560,-36,-542,-954,-1390,-1747,-1959,-2107,-2202,-2243,-2285,-2240,-2169,-2043,-1908,-1697,-1426,-1050,-682,-417,-158,40,225,373,500,702,790,926,1029,1147,1180,1148,1115,1088,1091,1102,1175,1244,1270,1228,1174,1087,958,889,826,850,896,989,1065,1137,1130,1042,1038,1044,1085,1155,1219,1262,1260,1143,1044,914,745,606,507,529,598,654,702,683,567,374,129,-46,-245,-382,-434,-472,-464,-448,-436,-414,-352,-250,-69,141,462,771,981,1116,1123,984,699,383,15,-422,-901,-1257,-1646,-2062,-2457,-2735,-2958,-3187,-3313,-3342,-3312,-3195,-3087,-2939,-2814,-2628,-2565,-2499,-2472,-2387,-2310,-2241,-2129,-2005,-1827,-1695,-1539,-1333,-1152,-1014,-863,-629,-348,-130,96,350,592,808,943,1061,1198,1264,1311,1348,1424,1546,1667,1761,1928,2071,2237,2376,2530,2639,2666,2685,2646,2507,2360,2149,1875,1530,1164,765,282,-210,-631,-967,-1342,-1610,-1806,-1936,-1992,-1973,-1910,-1841,-1698,-1529,-1323,-1179,-1004,-834,-723,-658,-569,-451,-301,-229,-119,-36,102,196,316,467,634,800,937,1087,1209,1284,1283,1233,1151,1111,1048,1054,1048,1070,1058,1055,1051,1086,1095,1146,1240,1383,1520,1676,1801,1882,1883,1851,1758,1652,1534,1386,1221,1074,924,756,546,297,61,-187,-452,-606,-708,-779,-869,-901,-928,-998,-1046,-1062,-1025,-980,-831,-609,-326,-73,159,293,388,412,449,463,469,437,379,287,156,-38,-310,-575,-799,-987,-1181,-1306,-1372,-1444,-1521,-1561,-1636,-1702,-1824,-1928,-2027,-2078,-2155,-2168,-2173,-2155,-2154,-2120,-2078,-2059,-1996,-1941,-1832,-1715,-1604,-1461,-1362,-1266,-1199,-1087,-990,-918,-839,-741,-603,-487,-315,-76,160,385,624,916,1227,1504,1782,2101,2401,2600,2797,2980,3050,3036,2923,2714,2452,2209,1993,1691,1383,1107,865,583,303,51,-119,-301,-510,-660,-715,-737,-765,-799,-816,-878,-946,-1009,-1035,-1051,-1038,-987,-879,-792,-684,-609,-537,-462,-374,-302,-236,-156,-98,-44,13,59,108,122,152,214,287,448,583,736,923,1102,1298,1483,1665,1849,2018,2118,2211,2288,2328,2327,2290,2130,1930,1758,1551,1311,1075,874,676,488,351,295,240,209,198,151,139,77,7,-72,-172,-287,-407,-501,-625,-752,-885,-972,-1017,-1004,-903,-749,-588,-391,-188,13,143,252,342,353,356,343,308,213,144,56,-112,-291,-486,-637,-836,-1010,-1131,-1236,-1343,-1477,-1589,-1709,-1915,-2149,-2345,-2483,-2624,-2743,-2809,-2845,-2864,-2888,-2896,-2906,-2902,-2878,-2794,-2657,-2500,-2274,-2025,-1813,-1595,-1322,-1029,-750,-486,-186,121,411,704,1065,1413,1663,1897,2139,2366,2539,2659,2795,2910,2974,3063,3139,3147,3086,3001,2843,2680,2512,2320,2074,1793,1509,1238,988,663,343,52,-227,-499,-741,-945,-1080,-1212,-1335,-1413,-1473,-1499,-1529,-1531,-1495,-1444,-1384,-1317,-1241,-1151,-1042,-954,-840,-699,-525,-382,-237,-19,196,343,500,665,783,877,945,1038,1120,1190,1232,1290,1313,1320,1326,1342,1382,1402,1414,1431,1444,1402,1368,1327,1242,1140,1055,993,901,825,776,746,696,632,580,509,462,419,364,307,216,102,-20,-136,-285,-432,-552,-662,-766,-833,-817,-749,-669,-542,-372,-251,-125,19,158,238,307,355,354,304,222,109,-71,-232,-396,-624,-841,-985,-1137,-1278,-1374,-1460,-1549,-1673,-1791,-1883,-2017,-2119,-2185,-2251,-2304,-2321,-2330,-2326,-2321,-2280,-2236,-2152,-2042,-1909,-1707,-1495,-1305,-1119,-946,-780,-652,-526,-365,-211,-70,65,239,384,480,596,732,890,1040,1219,1459,1697,1909,2094,2251,2364,2395,2407,2384,2347,2275,2215,2072,1925,1724,1506,1296,1025,736,533,335,117,-73,-236,-393,-605,-800,-926,-1033,-1128,-1170,-1176,-1197,-1176,-1142,-1127,-1121,-1091,-1049,-976,-881,-738,-578,-460,-331,-205,-79,24,119,217,343,450,536,611,653,680,682,692,716,755,802,855,940,1010,1083,1163,1230,1305,1375,1441,1519,1567,1602,1629,1653,1662,1636,1584,1485,1374,1258,1139,1017,881,753,622,440,259,118,-51,-219,-404,-535,-642,-767,-873,-964,-1037,-1071,-1093,-1065,-978,-882,-768,-624,-491,-364,-228,-123,-44,29,104,149,168,156,141,82,-1,-82,-196,-325,-443,-558,-674,-776,-893,-982,-1116,-1248,-1347,-1449,-1541,-1617,-1698,-1762,-1840,-1883,-1905,-1942,-1975,-1996,-1996,-1972,-1953,-1945,-1926,-1915,-1874,-1819,-1760,-1665,-1524,-1368,-1217,-1044,-810,-549,-337,-99,186,485,744,1003,1291,1553,1803,1991,2150,2326,2487,2600,2717,2844,2952,3009,2994,2880,2692,2482,2280,2021,1734,1495,1214,851,475,159,-131,-454,-741,-945,-1108,-1232,-1326,-1393,-1445,-1494,-1550,-1584,-1571,-1529,-1479,-1432,-1367,-1261,-1141,-1004,-914,-855,-771,-670,-558,-427,-259,-98,42,181,304,417,499,588,718,859,1005,1152,1313,1447,1532,1598,1675,1758,1830,1901,1986,2046,2076,2111,2129,2121,2065,1975,1872,1765,1656,1533,1358,1157,970,793,600,381,172,15,-136,-286,-416,-530,-649,-796,-932,-1033,-1087,-1136,-1152,-1143,-1098,-1032,-946,-838,-716,-556,-417,-292,-171,-45,51,82,78,46,-21,-100,-210,-356,-501,-627,-773,-908,-1030,-1152,-1241,-1332,-1419,-1493,-1556,-1613,-1663,-1706,-1743,-1759,-1803,-1839,-1872,-1921,-1965,-1998,-1998,-1993,-1969,-1928,-1877,-1788,-1659,-1514,-1390,-1263,-1108,-933,-763,-586,-354,-108,94,303,532,757,998,1190,1369,1570,1786,1972,2141,2325,2480,2566,2615,2608,2551,2494,2396,2261,2114,1941,1757,1508,1212,954,703,417,165,-23,-206,-382,-557,-691,-814,-950,-1044,-1098,-1123,-1143,-1120,-1074,-1027,-977,-918,-855,-794,-726,-652,-564,-483,-414,-320,-229,-167,-103,-68,-46,-7,50,167,295,406,517,613,693,730,758,813,896,985,1073,1177,1260,1300,1313,1298,1298,1330,1381,1438,1470,1475,1466,1411,1323,1233,1149,1037,901,782,688,609,510,388,289,193,76,-51,-153,-226,-312,-395,-471,-562,-674,-803,-922,-1028,-1106,-1132,-1116,-1075,-1013,-918,-821,-712,-562,-426,-313,-200,-100,-7,78,117,137,117,102,80,62,43,-5,-30,-72,-119,-175,-221,-279,-376,-514,-644,-773,-919,-1048,-1190,-1330,-1472,-1609,-1693,-1785,-1870,-1929,-1979,-1984,-1966,-1948,-1901,-1865,-1791,-1672,-1576,-1458,-1345,-1213,-1077,-930,-756,-569,-350,-185,-12,186,381,555,736,946,1116,1244,1381,1548,1680,1779,1848,1920,1966,2002,2019,2000,1965,1907,1847,1750,1638,1508,1363,1174,972,819,657,460,247,67,-83,-255,-427,-563,-665,-766,-858,-927,-953,-972,-969,-978,-996,-972,-935,-887,-859,-815,-745,-685,-619,-524,-423,-328,-259,-191,-96,23,118,177,256,342,432,525,618,695,754,815,892,994,1090,1178,1268,1338,1405,1456,1503,1525,1512,1514,1495,1473,1425,1367,1284,1124,935,788,658,524,397,267,148,16,-107,-214,-322,-437,-526,-576,-618,-688,-760,-820,-895,-957,-990,-996,-980,-946,-863,-756,-603,-389,-173,39,202,355,524,686,802,885,947,908,851,787,697,569,436,307,177,64,-33,-152,-304,-447,-572,-709,-896,-1085,-1271,-1444,-1633,-1813,-1971,-2137,-2281,-2415,-2485,-2554,-2586,-2581,-2546,-2478,-2379,-2251,-2130,-1988,-1833,-1667,-1532,-1376,-1159,-953,-781,-610,-394,-156,41,236,452,672,870,1053,1278,1489,1645,1796,1957,2076,2182,2242,2300,2337,2336,2329,2270,2170,2041,1902,1737,1524,1306,1143,975,779,583,418,281,108,-45,-173,-296,-433,-564,-653,-750,-860,-946,-997,-1043,-1094,-1100,-1096,-1065,-1014,-944,-885,-804,-701,-611,-521,-449,-349,-229,-94,18,105,222,342,434,522,602,687,758,823,912,986,1029,1078,1116,1175,1226,1259,1288,1307,1315,1319,1298,1279,1267,1227,1178,1091,1004,906,778,654,549,440,323,199,96,17,-76,-177,-267,-326,-388,-451,-516,-558,-615,-687,-765,-823,-878,-922,-937,-924,-898,-827,-708,-595,-445,-294,-133,7,137,300,453,535,587,624,620,599,549,448,332,241,152,55,-48,-126,-212,-316,-429,-527,-615,-714,-847,-1007,-1155,-1300,-1455,-1609,-1739,-1865,-2014,-2119,-2171,-2205,-2228,-2221,-2198,-2135,-2054,-1943,-1848,-1749,-1619,-1463,-1317,-1178,-995,-815,-640,-459,-240,-10,187,380,591,798,975,1162,1327,1516,1681,1806,1874,1953,2034,2084,2134,2163,2184,2185,2161,2100,1988,1870,1734,1565,1382,1219,1054,836,625,446,287,98,-79,-218,-350,-499,-634,-728,-791,-860,-924,-982,-1045,-1084,-1117,-1135,-1129,-1132,-1111,-1056,-988,-918,-846,-760,-676,-564,-414,-246,-105,23,183,348,470,603,731,833,915,970,1000,1026,1063,1094,1123,1142,1145,1148,1153,1163,1163,1169,1166,1125,1093,1024,919,781,651,557,461,338,208,113,28,-54,-128,-186,-228,-268,-289,-312,-344,-358,-382,-390,-388,-399,-406,-377,-345,-289,-221,-151,-68,50,166,266,344,417,468,500,522,542,514,474,426,344,217,91,-5,-89,-199,-331,-436,-556,-711,-841,-974,-1106,-1262,-1426,-1545,-1665,-1808,-1947,-2040,-2110,-2153,-2195,-2193,-2196,-2189,-2155,-2088,-1998,-1879,-1751,-1636,-1510,-1350,-1163,-1008,-834,-627,-406,-178,21,230,460,677,872,1038,1238,1431,1592,1708,1826,1927,1992,2053,2119,2140,2133,2112,2066,1996,1931,1843,1707,1542,1379,1237,1030,809,626,442,234,34,-133,-300,-467,-618,-729,-825,-920,-1014,-1086,-1120,-1163,-1214,-1244,-1249,-1240,-1221,-1189,-1138,-1067,-968,-855,-758,-677,-528,-379,-242,-141,-18,90,189,282,373,438,492,561,621,700,753,802,856,917,949,988,1026,1050,1073,1076,1071,1032,998,976,948,918,868,840,804,762,730,710,686,674,651,626,611,584,555,519,497,464,416,389,366,339,306,263,221,170,130,116,95,66,53,49,35,31,3,-33,-50,-87,-138,-190,-272,-362,-466,-581,-693,-795,-913,-1027,-1100,-1170,-1240,-1290,-1320,-1342,-1373,-1393,-1428,-1434,-1462,-1497,-1531,-1539,-1571,-1577,-1595,-1594,-1580,-1565,-1539,-1493,-1402,-1297,-1199,-1108,-983,-854,-750,-638,-495,-364,-217,-101,55,211,348,460,601,745,861,971,1099,1196,1273,1340,1398,1452,1484,1511,1514,1495,1481,1459,1439,1378,1343,1282,1191,1092,980,885,763,608,451,319,206,78,-64,-177,-276,-386,-471,-531,-579,-650,-685,-721,-762,-780,-814,-837,-839,-851,-838,-821,-789,-723,-650,-598,-533,-464,-361,-271,-188,-97,8,98,166,252,342,414,475,524,598,680,736,793,833,865,908,945,982,1024,1026,1035,1043,1034,1038,1013,972,928,882,842,762,682,607,551,481,406,366,305,244,186,135,71,35,2,-32,-63,-105,-138,-181,-203,-232,-245,-248,-253,-227,-187,-166,-172,-163,-143,-140,-119,-113,-107,-108,-137,-166,-213,-249,-294,-333,-378,-438,-466,-507,-562,-620,-682,-712,-780,-842,-887,-956,-1033,-1113,-1168,-1220,-1264,-1298,-1340,-1356,-1379,-1376,-1359,-1346,-1310,-1253,-1177,-1122,-1064,-987,-903,-821,-735,-598,-460,-326,-217,-79,65,197,325,494,657,779,903,1035,1142,1222,1291,1359,1407,1455,1485,1498,1497,1478,1455,1418,1344,1266,1193,1101,966,827,712,578,428,269,130,0,-135,-277,-392,-470,-559,-647,-712,-791,-853,-877,-913,-957,-983,-979,-968,-939,-885,-841,-800,-730,-641,-519,-434,-356,-248,-116,-16,66,153,240,337,389,443,511,587,651,701,743,793,828,849,878,892,913,936,959,949,940,929,893,859,816,789,750,710,682,631,584,522,483,451,411,369,341,303,262,234,177,145,110,71,36,10,-7,-36,-52,-73,-104,-115,-124,-130,-154,-168,-178,-194,-207,-225,-241,-259,-291,-327,-372,-404,-445,-499,-536,-575,-614,-678,-754,-784,-825,-870,-931,-967,-971,-1004,-1022,-1036,-1044,-1058,-1070,-1057,-1036,-1017,-984,-945,-903,-860,-803,-758,-714,-652,-587,-513,-436,-366,-284,-217,-153,-90,-18,62,129,196,261,350,396,441,486,546,592,636,662,701,722,746,757,759,761,751,740,727,709,668,636,608,555,510,469,400,366,306,254,192,143,105,79,24,-24,-43,-75,-94,-135,-161,-165,-164,-186,-197,-207,-223,-216,-224,-232,-221,-214,-205,-193,-175,-159,-142,-122,-100,-78,-55,-22,24,39,76,106,140,195,216,241,253,318,375,402,430,454,497,522,561,590,608,625,625,656,650,641,637,621,614,603,579,538,506,473,437,406,364,331,291,247,177,107,52,6,-55,-117,-166,-224,-296,-356,-409,-456,-527,-567,-575,-613,-623,-635,-653,-675,-675,-670,-677,-659,-638,-613,-592,-586,-545,-513,-492,-453,-409,-364,-320,-298,-266,-217,-191,-153,-124,-117,-98,-71,-86,-108,-112,-107,-105,-120,-130,-151,-164,-192,-206,-215,-228,-239,-247,-254,-256,-282,-279,-275,-282,-277,-280,-252,-235,-235,-210,-193,-166,-133,-88,-63,-36,9,61,121,145,184,234,271,290,325,355,372,402,425,429,436,432,430,418,391,396,401,387,379,350,340,318,309,283,257,245,227,225,206,179,147,139,136,121,125,103,102,126,125,119,119,138,139,137,135,138,144,151,166,165,170,172,158,174,189,181,200,235,213,223,233,216,227,225,226,224,195,174,159,131,102,66,34,8,-22,-72,-94,-128,-169,-186,-219,-255,-284,-312,-333,-348,-371,-389,-398,-424,-436,-440,-456,-446,-461,-466,-453,-434,-419,-397,-384,-365,-326,-306,-270,-237,-203,-153,-103,-73,-61,-34,-17,17,55,66,94,111,123,137,148,150,140,149,142,132,116,91,78,58,41,29,0,-22,-39,-69,-77,-84,-99,-115,-122,-132,-134,-134,-130,-114,-117,-105,-69,-67,-59,-42,-28,-9,20,49,80,93,101,127,146,142,165,183,205,237,253,252,257,253,251,258,260,234,236,219,206,193,157,161,140,117,105,68,54,39,22,10,8,13,0,-11,-27,-43,-43,-51,-56,-39,-56,-60,-61,-63,-61,-54,-48,-42,-20,-27,-21,-20,-9,-3,-10,0,10,28,16,14,3,-5,11,9,24,11,7,20,29,28,23,13,18,9,-8,-20,-41,-33,-32,-45,-48,-63,-77,-87,-100,-113,-143,-127,-121,-132,-120,-139,-151,-149,-143,-138,-134,-123,-126,-128,-110,-105,-97,-87,-90,-68,-56,-56,-28,-13,1,20,28,47,72,91,93,102,127,133,143,153,179,175,165,160,166,147,156,181,147,146,145,145,123,103,103,72,70,75,55,44,28,-1,-20,-26,-48,-59,-79,-82,-82,-92,-101,-104,-100,-108,-96,-96,-101,-102,-100,-103,-91,-74,-76,-68,-73,-72,-71,-75,-52,-53,-41,-37,-24,-28,-41,-25,-11,0,16,24,24,19,24,18,25,25,42,42,43,52,38,31,21,28,20,4,16,17,8,2,10,7,0,-9,-22,-42,-40,-34,-40,-48,-44,-33,-57,-61,-55,-52,-48,-42,-26,-4,2,14,41,44,51,57,55,78,88,92,99,102,105,118,127,136,152,156,162,156,156,137,131,113,94,78,64,55,36,22,2,-20,-34,-52,-70,-89,-99,-115,-105,-108,-124,-116,-129,-138,-136,-148,-152,-117,-115,-130,-123,-111,-100,-94,-85,-73,-42,-22,-16,0,24,32,31,44,59,69,69,79,90,97,91,85,105,105,95,100,96,91,88,76,77,82,68,46,28,11,2,3,1,-7,-19,-43,-56,-72,-89,-90,-96,-105,-99,-106,-108,-114,-120,-104,-94,-101,-97,-82,-78,-60,-68,-69,-39,-19,-17,-16,5,31,44,39,46,73,79,77,86,98,105,120,113,115,114,109,102,91,81,61,70,61,68,55,38,35,34,17,-13,-20,-22,-26,-27,-38,-34,-43,-52,-57,-53,-62,-58,-53,-85,-62,-54,-39,-40,-17,-11,-7,-17,-6,3,3,0,2,16,24,26,36,46,47,59,63,45,48,52,42,44,36,27,23,13,0,7,-10,-14,-7,-24,-24,-14,-14,-2,7,-1,3,-7,-35,-49,-58,-68,-80,-102,-106,-95,-90,-82,-73,-64,-59,-51,-46,-36,-27,-11,11,22,27,13,12,27,18,20,19,24,15,5,0,15,30,22,42,72,88,92,103,102,98,107,92,66,45,22,-1,-8,-29,-41,-46,-46,-60,-51,-27,-19,-4,-3,6,16,5,-5,0,-1,-19,-27,-28,-39,-54,-56,-46,-39,-42,-44,-30,-27,-12,10,13,26,22,11,12,11,8,20,15,6,-3,-15,-24,-22,-11,-5,8,8,14,39,41,49,55,55,49,35,23,13,8,17,6,-3,-3,-17,-36,-32,-19,-17,-11,-11,-7,-6,-3,14,10,13,24,39,50,63,90,104,120,123,91,47,-22,-100,-163,-231,-294,-317,-310,-265,-142,38,292,551,753,780,743,687,466,203,-134,-397,-630,-881,-1063,-1124,-1091,-965,-747,-514,-293,-9,202,362,481,557,550,507,427,306,229,142,143,147,140,133,119,118,138,154,222,263,267,262,308,283,283,293,256,137,-33,-168,-279,-333,-446,-487,-501,-496,-451,-384,-266,-159,-28,47,86,51,8,19,-33,-18,-35,-29,-65,-161,-207,-195,-163,-114,-23,-7,-39,-44,-62,-110,-163,-224,-222,-114,54,201,700,1451,1994,2120,2106,1905,1338,675,11,-821,-1554,-2037,-2385,-2577,-2502,-2312,-1942,-1426,-903,-481,-93,285,558,776,970,1250,1474,1572,1407,1294,1209,1070,799,526,188,-80,-236,-361,-447,-443,-326,-246,-163,-72,19,89,94,32,-82,-129,-227,-290,-415,-414,-503,-543,-489,-382,-234,-56,183,311,561,633,579,517,391,198,101,-31,-105,-212,-195,-385,-418,-397,-348,-330,-416,-489,-344,-109,-306,-160,-75,34,18,97,160,169,216,226,391,171,402,395,273,274,185,161,254,306,160,62,106,-94,12,-16,-66,45,-99,-79,-46,-113,-110,-119,-71,-21,-213,-17,96,177,25,307,236,152,144,-133,-211,-237,-364,-279,-176,-226,-225,-115,-91,-102,42,-108,-10,-30,-102,-16,9,35,85,67,146,169,219,246,237,217,117,71,-80,0,-179,-90,69,32,-24,117,97,83,69,3,-128,-116,-205,-239,-154,-222,-159,36,-15,21,52,99,19,-35,7,-148,-94,-57,-111,-69,-90,-26,-42,-6,61,80,-77,83,-138,-88,-119,109,146,154,220,388,314,189,71,257,65,167,185,-10,72,-71,-108,-153,-111,-197,-192,-185,-196,-181,-116,-294,-21,91,-40,40,87,196,121,119,202,159,63,151,165,-123,-175,-310,-283,-235,-42,1,223,155,59,345,247,179,389,264,256,175,15,-94,-49,-51,-138,-63,-303,-363,-409,-469,-278,-220,-86,168,88,92,156,222,277,493,511,270,205,-219,-299,-264,-487,-456,-397,-592,-662,-389,-469,-373,82,274,420,759,785,550,612,385,127,155,23,-239,-371,-427,-580,-466,-298,-230,-245,-179,-208,-197,86,126,225,369,483,484,539,314,182,-5,-165,-313,-226,-193,-275,-241,-164,-87,61,259,301,299,297,231,150,111,22,-94,-178,-219,-268,-80,-113,-92,70,213,266,445,431,295,33,86,-103,-72,-17,-100,-159,-271,-238,-275,-61,-136,-244,-219,-219,-275,-207,-217,-251,-160,-25,-14,130,233,283,285,387,403,420,408,313,115,53,17,-84,-53,-48,-201,-212,-151,-60,97,108,151,176,244,144,116,-53,-305,-445,-429,-400,-440,-265,-221,-244,-123,-39,4,65,92,-49,-134,27,47,92,267,316,201,227,298,189,173,80,-66,-176,-161,-260,-325,-250,-242,-192,-20,70,131,208,147,5,17,-28,-60,-32,-6,-118,-4,111,100,211,275,257,269,323,231,144,47,-167,-307,-334,-333,-348,-309,-190,-167,-40,161,167,156,148,36,-96,-3,-86,-90,-91,-98,-15,169,291,260,328,313,196,253,226,97,-4,-89,-196,-275,-230,-227,-235,-103,-79,-24,64,91,-26,0,57,0,37,43,-97,-145,-94,-112,-125,-5,-17,-37,95,148,162,175,165,67,23,0,-36,-8,-34,-49,-132,-71,-86,-99,-71,-153,-139,-91,-56,6,142,200,159,206,293,218,196,95,-45,-125,-75]
+  }
+  function getInvocationSample(opts){
+    if(!opts) opts = {}
+    let prefix = getPrefixSample()
+    let pview = new DataView(new ArrayBuffer(prefix.length * 2))
+    let offset = 0
+    for(var i=0 ;i < prefix.length; i++){
+      pview.setInt16(offset, prefix[i], true);
+      offset += 2
+    }
+    if(opts.prepend) {
+      return inst.getBlobFromWav({prepend:pview})
+    }else{
+      let dataViews = [pview]
+      return inst.getBlobFromWav({dataViews:dataViews})
+    }
+  }
+  inst.getInvocationSample = getInvocationSample
+
+  inst.stopRequest = function(){
+    // ExpectSpeechTimedOut
+    var token = inst.accessToken;
     var formData = new FormData();
-
     // JavaScript file-like object
     var metadata = {
         "messageHeader": {
@@ -369,58 +562,96 @@ function AVSaurus(options) {
     var blob = new Blob([content], { type: "application/json; charset=UTF-8"});
     formData.append("request", blob, 'json');
 
-    // audio/L16; rate=16000; channels=1
-    formData.append("audio", this.getBlobFromWav('audio/L16; rate=16000; channels=1'), 'sample');
+    var request = new XMLHttpRequest();
+    request.responseType = "arraybuffer"
+    request.open("POST", "https://access-alexa-na.amazon.com/v1/avs/speechrecognizer/expectspeechtimedout");
+    request.setRequestHeader("Authorization", "Bearer " + token);
 
+    request.onload = function(e) {
+      console.log('ExpectSpeechTimedOut', e)
+    }
+    request.onerror = function(e) {
+      console.log('ExpectSpeechTimedOut', e)
+    }
+    request.send(formData);
+    
+  }
+
+  inst.avsRequest = function(sample, opts){
+    if(!opts) opts = {}
+    if(!opts.callback) opts.callback = function(){}
+    var token = inst.accessToken;
+    var formData = new FormData();
+    // JavaScript file-like object
+    var metadata = {
+        "messageHeader": {
+            "deviceContext":[{
+                "name":"playbackState",
+                "namespace":"AudioPlayer",
+                "payload":{
+                    "streamId":"",
+                    "offsetInMilliseconds":"0",
+                    "playerActivity":"IDLE"
+                }
+            }]
+        },
+        "messageBody":{
+            //"profile":"alexa-close-talk",
+            "profile":"alexa-far-field-local",
+            "locale":"en-us",
+            "format":"audio/L16; rate=16000; channels=1"
+        }
+    }
+    var content = JSON.stringify(metadata); // the body of the new file...
+    var blob = new Blob([content], { type: "application/json; charset=UTF-8"});
+    formData.append("request", blob, 'json');
+    if(!sample) sample = inst.getBlobFromWav()
+    if(options.playRequest){
+      var blobURL = window.URL.createObjectURL(sample);
+      var audio0 = new Audio(blobURL);
+      audio0.play();
+    }
+    if(options.saveRequest) inst.saveData(sample, 'sample.wav')
+    formData.append("audio", sample, 'sample');
+    inst.trigger('sending')
     var request = new XMLHttpRequest();
     request.responseType = "arraybuffer"
     request.open("POST", "https://access-alexa-na.amazon.com/v1/avs/speechrecognizer/recognize");
     request.setRequestHeader("Authorization", "Bearer " + token);
 
     request.onload = function(e) {
-
+      opts.callback(request)
       if (request.status < 200 || request.status >= 300) {
         if(request.status == 403){
           // token expired
           inst.trigger('token_expired')
         }
-        inst.startRecording()
-        return console.error('Request failed.  Returned status of ' + request.status)
+        console.error('Request failed.  Returned status of ' + request.status)
+        return inst.trigger('replied', [{shouldListen:false, opts:opts}])
       }
-
       if(request.status == 204){ // no content
-        inst.startRecording()
-        return inst.trigger('replied')
+        return inst.trigger('replied', [{shouldListen:false, opts:opts}])
       }
-
       // get boundary
       var contentType = request.getResponseHeader("Content-Type");
       var boundary = ""
       try{
         boundary = contentType.match(/boundary=(.+?)\;/)[1]
       }catch(er){}
-
-      inst.trigger('talking')
-
       let shouldListen = false
       var sounds = []
       var arrayBuffer = request.response;
       if (arrayBuffer) {
         var byteArray = new Uint8Array(arrayBuffer);
         var sections = Multipart.parse(byteArray, boundary);
-        console.log(sections);
-
         for (var i = 0; i !== sections.length; ++i) {
           if (sections[i].header['content-type'] === 'audio/mpeg') {
             sounds.push(new Audio(window.URL.createObjectURL(sections[i].file)))
           }else{
-
-
             let text = sections[i].text
             console.log('Reply text', text)
             try{
                 let jobj = JSON.parse(text)
-
                 // get streams if any
                 let streams = inst.getStreams(jobj)
                 if(streams.length){
@@ -430,187 +661,48 @@ function AVSaurus(options) {
                     sounds.push(a)
                   }
                 }
-
                 // should keep listening
                 shouldListen = inst.shouldListen(jobj)
-
                 inst.trigger('replyobject', [jobj])
               }catch(err){
                 console.log('Failed to parse JSON')
               }
-
-            /*
-            sections[i].file.text().then(text=>{
-              console.log('Reply text:', text);
-              try{
-                let jobj = JSON.parse(text)
-
-                // get streams if any
-                let streams = inst.getStreams(jobj)
-                console.log(streams)
-                if(streams.length){
-                  for(let j=0;j<streams.length;j++){
-                    let a = new Audio(streams[j])
-                    a.crossOrigin = 'anonymous';
-                    sounds.push(a)
-                  }
-                }
-
-                inst.trigger('replyobject', [jobj])
-              }catch(err){
-                console.log('Failed to parse JSON')
-              }
-            })
-            */
-
-            /*
-            var reader = new FileReader();
-
-            // This fires after the blob has been read/loaded.
-            reader.addEventListener('loadend', (e) => {
-                //var text = e.srcElement.result;
-                jsonParts.push(e.target.result)
-
-                let text = jsonParts.join('')
-                console.log('Reply text:', text);
-                try{
-                  let jobj = JSON.parse(text)
-
-                  // get streams if any
-                  let streams = inst.getStreams(jobj)
-                  console.log(streams)
-                  if(streams.length){
-                    for(let j=0;j<streams.length;j++){
-                      let a = new Audio(streams[j])
-                      a.crossOrigin = 'anonymous';
-                      sounds.push(a)
-                    }
-                  }
-
-                  inst.trigger('replyobject', [jobj])
-                }catch(err){
-                  console.log('Failed to parse JSON')
-                }
-
-            });
-            // Start reading the blob as text.
-            reader.readAsText(sections[i].file);
-
-            */
 
           }
         }
       }
+      if(sounds && sounds.length && !opts.supressPlay) inst.trigger('talking')
+      if(!opts.supressPlay) {
+        inst.playSounds(sounds, function(err){
+          if (err) console.error(err)
+          inst.trigger('replied', [{
+            shouldListen:shouldListen, 
+            opts:opts
+          }])
+        })
+      } else {
 
-      
+        // save playlist for later
+        inst.suppressedSounds = sounds
 
-      inst.playSounds(sounds, function(err){
-        if(err){
-          console.log('Warning: Failed to play sound', err)
-          inst.confirmPlaySounds(sounds, function(err){
-            if(err){
-              sounds = []
-              shouldListen ? inst.keywordDetected() : inst.startRecording()
-              inst.trigger('replied')
-            }
-          })
-        }else{
-          shouldListen ? inst.keywordDetected() : inst.startRecording()
-          inst.trigger('replied')
-        }
-      })
+        inst.trigger('replied', [{
+          shouldListen:shouldListen, 
+          opts:opts
+        }])
+      }
     }
-
+    request.onerror = function(e) {
+      inst.trigger('error', [e])
+      inst.trigger('replied', [{
+        shouldListen:false
+      }])
+    }
     request.send(formData);
-  }
-
-  this.playSounds = function(sounds, cb) {
-    if (sounds && sounds.length > 0) {
-      var i = -1;
-
-      function playSnd() {
-        i++;
-        if (i == sounds.length) {
-          sounds = []
-          cb.call(inst)
-          return;
-        };
-        sounds[i].addEventListener('ended', playSnd);
-        var prms = sounds[i].play()
-        if (prms) {
-          prms.catch(function(err) {
-            cb.call(inst, err)
-          });
-        }
-      }
-      playSnd();
-    }
-  }
-
-  this.confirmPlaySounds = function(sounds, cb){
-    if(inst.trigger('click_confirm', [function(){
-      inst.playSounds(sounds, cb)
-    }])){
-      return;
-    }
-    var dv = document.createElement('button')
-    dv.id = 'confirm_play_btn'
-    dv.style.left = '10px'
-    dv.innerHTML = 'Play the response'
-    dv.onclick = function(){
-      dv.parentNode.removeChild(dv)
-      inst.playSounds(sounds, cb)
-    }
-    document.body.appendChild(dv)
-  }
-
-  // events minimal implementation
-  this.on = function(evtName, fn){
-    if(!this.events){
-      this.events = {}
-    }
-    var npts = evtName.split('.'), there = this.events
-    for(var i=0; i<npts.length; i++){
-      if(!there[npts[i]]){
-        if(i == npts.length - 1){
-          there[npts[i]] = fn
-          break;
-        }else{
-          there[npts[i]] = {}
-        }
-      }
-      there = there[npts[i]]
-    }
-  }
-  this.trigger = function(evtName, args){
-    var inst = this
-    if(!this.events){ return }
-    var npts = evtName.split('.'), there = this.events, isRun = false
-    for(var i=0; i<npts.length; i++){
-      if(there[npts[i]]){
-        if(i == npts.length - 1 && typeof there[npts[i]] != 'function'){
-          for(var j in there[npts[i]]){
-            if(typeof there[npts[i]][j] == 'function'){
-              isRun = true
-              there[npts[i]][j].apply(inst, args)
-            }
-          }
-          return isRun
-        }
-        if(typeof there[npts[i]] == 'function'){
-          isRun = true
-          there[npts[i]].apply(inst, args)
-        }
-        there = there[npts[i]]
-      }else{
-        break
-      }
-    }
-    return isRun
   }
 
   // generate sounds
   inst.sound = function(frequency, type, time){
+    var AudioContext = window.AudioContext || window.webkitAudioContext;
     var context = inst.soundContext ? inst.soundContext : new AudioContext()
     inst.soundContext = context;
     var o = null
@@ -623,142 +715,109 @@ function AVSaurus(options) {
     o.connect(g)
     o.frequency.value = frequency
     g.connect(context.destination)
-
     o.start(0)
-
     g.gain.setValueAtTime(g.gain.value, context.currentTime);
     g.gain.exponentialRampToValueAtTime(0.00001, context.currentTime + time)
+  }
 
+  // download blob to local machine
+	// example: saveData(blob, fileName)
+  inst.saveData = (function () {
+    var a = document.createElement("a");
+    document.body.appendChild(a);
+    return function (blob, fileName) {
+        var url = window.URL.createObjectURL(blob);
+        a.href = url;
+        a.download = fileName;
+        a.click();
+        window.URL.revokeObjectURL(url);
+    };
+  }());
 
+  inst.businessLogic = function(){
+    
+    inst.silenceTimeoutMs = 7000
+
+    // FFT silence detection
+    inst.on('ready.avsa', ()=>{
+      console.log('ready')
+      inst.sound(87.31, 'sine')
+      inst.trigger('ready-status')
+      inst.wakewordDetect = true
+      inst.pauseRecord = true
+      inst.detectSilence = false
+    })
+    inst.on('wakeword.avsa', ()=>{
+      console.log('wakeword')
+      inst.sound(440.0, 'sine', 0.3)
+      
+      // start recording
+      
+      setTimeout(()=>{
+        inst.createWav()
+        inst.wakewordDetect = false
+        inst.pauseRecord = false
+        inst.detectSilence = true
+        inst.trigger('listening')
+      }, 300)
+
+      // if recording for more than 15 seconds, trigger silence
+      clearTimeout(inst.triggerTimeout)
+      inst.triggerTimeout = setTimeout(()=>{
+        if(!inst.pauseRecord) inst.trigger('silence')
+      }, inst.silenceTimeoutMs)
+
+    })
+    inst.on('silence.avsa', ()=>{
+      console.log('silence detected')
+      inst.pauseRecord = true
+      inst.detectSilence = false
+      inst.wakewordDetect = false
+
+      clearTimeout(inst.triggerTimeout)
+
+      if(inst.skipInvocation) {
+        inst.skipInvocation = false
+        console.log('-----SEND RECORDING-----')
+        inst.avsRequest()
+        inst.deleteWav()
+        inst.triggerTimeout = setTimeout(()=>{
+          if(!inst.pauseRecord) inst.trigger('silence')
+        }, inst.silenceTimeoutMs)
+      }else{
+        let sample = inst.getInvocationSample()
+        console.log('-----INVOKE SKILL-----')
+        inst.avsRequest(sample, {invocation:true, supressPlay:true})
+      }
+    })
+    inst.on('replied.avsa', (ev)=>{
+      console.log('replied')
+      if(ev && ev.opts && ev.opts.invocation) {
+        console.log('-----SEND RECORDING-----')
+        inst.avsRequest()
+        inst.deleteWav()
+      }else if(ev && ev.shouldListen){
+        console.log('-----LISTENING FOR REPLY-----')
+        inst.createWav()
+        inst.pauseRecord = false
+        inst.detectSilence = true
+        inst.wakewordDetect = false
+        inst.skipInvocation = true
+        inst.trigger('listening')
+      }else{
+        console.log('-----DONE-----')
+        inst.pauseRecord = true
+        inst.detectSilence = false
+        inst.wakewordDetect = true
+        inst.trigger('ready')
+      }
+    })
 
   }
 
 
-  // When the page is loaded, we spawn a new recognizer worker and call getUserMedia to
-  // request access to the microphone
-
-  function init() {
-    console.log("Initializing web audio and speech recognizer, waiting for approval to access the microphone");
-    callbackManager = new CallbackManager();
-    spawnWorker(options.workerDir + "/recognizer.js", function(worker) {
-      // This is the onmessage function, once the worker is fully loaded
-      worker.onmessage = function(e) {
-
-        //console.log('Recognizer: ', e.data)
-
-        // This is the case when we have a callback id to be called
-        if (e.data.hasOwnProperty('id')) {
-          var clb = callbackManager.get(e.data['id']);
-          var data = {};
-          if (e.data.hasOwnProperty('data')){
-            data = e.data.data;
-          }
-          if (clb){
-            clb(data);
-          }
-        }
-        // This is a case when the recognizer has a new count number
-        if (e.data.hasOwnProperty('hyp')) {
-          var newCount = e.data.hyp;
-          if (e.data.hasOwnProperty('final') && e.data.final) {
-            newCount = "Final: " + newCount;
-          }
-          //console.log(newCount);
-        }
-
-        // this triggers each time new keyword is recognized
-        if (e.data.hasOwnProperty('hypseg')) {
-          if(e.data.hypseg.length > detectedKeywords){
-            detectedKeywords = e.data.hypseg.length
-            var detected = {
-              'word':e.data.hypseg[0].word,
-              'start':e.data.hypseg[0].start,
-              'end':e.data.hypseg[0].end
-            }
-            if(inst.keywordDetected){
-              inst.keywordDetected(detected)
-            }
-          }
-        }
-
-        // This is the case when we have an error
-        if (e.data.hasOwnProperty('status') && (e.data.status == "error")) {
-          console.log("Error in " + e.data.command + " with code " + e.data.code);
-        }
-      };
-      // Once the worker is fully loaded, we can call the initialize function
-      initRecognizer();
-    });
-
-    // The following is to initialize Web Audio
-    try {
-      window.AudioContext = window.AudioContext || window.webkitAudioContext;
-      navigator.getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
-      window.URL = window.URL || window.webkitURL;
-      audioContext = new AudioContext();
-    } catch (e) {
-      console.log("Error initializing Web Audio browser");
-    }
-    if (navigator.getUserMedia) {
-      navigator.getUserMedia({
-        audio: true
-      }, startUserMedia, function(e) {
-        console.log("No live audio input in this browser");
-      });
-    } else {
-      console.log("No web audio support in this browser");
-    }
-  };
-
-  // This is the list of words that need to be added to the recognizer
-  // This follows the CMU dictionary format
-  /*
-  var wordList = [["ONE", "W AH N"], ["TWO", "T UW"], ["THREE", "TH R IY"], ["FOUR", "F AO R"], ["FIVE", "F AY V"], ["SIX", "S IH K S"], ["SEVEN", "S EH V AH N"], ["EIGHT", "EY T"], ["NINE", "N AY N"], ["ZERO", "Z IH R OW"], ["NEW-YORK", "N UW Y AO R K"], ["NEW-YORK-CITY", "N UW Y AO R K S IH T IY"], ["PARIS", "P AE R IH S"] , ["PARIS(2)", "P EH R IH S"], ["SHANGHAI", "SH AE NG HH AY"], ["SAN-FRANCISCO", "S AE N F R AE N S IH S K OW"], ["LONDON", "L AH N D AH N"], ["BERLIN", "B ER L IH N"], ["SUCKS", "S AH K S"], ["ROCKS", "R AA K S"], ["IS", "IH Z"], ["NOT", "N AA T"], ["GOOD", "G IH D"], ["GOOD(2)", "G UH D"], ["GREAT", "G R EY T"], ["WINDOWS", "W IH N D OW Z"], ["LINUX", "L IH N AH K S"], ["UNIX", "Y UW N IH K S"], ["MAC", "M AE K"], ["AND", "AE N D"], ["AND(2)", "AH N D"], ["O", "OW"], ["S", "EH S"], ["X", "EH K S"]];
-  var keywords = [{title: "SIX", g: "SIX"}, {title: "ROCKS", g: "ROCKS"}, {title: "GREAT", g: "GREAT"}];
-  var keywordIds = [];
-  */
-
-
-  // K AH M P Y UW T ER .
-  var wordList = [
-    ["COMPUTER", "K AH M P Y UW T ER"]
-  ];
-  var keywords = [{
-    title: "COMPUTER",
-    g: "COMPUTER"
-  }];
-  var keywordIds = [];
-
-  // add wakewords
-  /**
-   *
-   {
-     'wakewords':[{
-       id:'COMPUTER',
-       pronounce: 'K AH M P Y UW T ER' // from http://www.speech.cs.cmu.edu/cgi-bin/cmudict
-     }]
-   }
-   */
-  if(options.wakewords){
-    wordList = []
-    keywords = []
-    var id, pro
-    for(var i in options.wakewords){
-      id = options.wakewords[i].id, pro = options.wakewords[i].pronounce
-      wordList.push([id, pro])
-      keywords.push({
-        title: id,
-        g: id
-      })
-    }
-  }
-
-
-
-  // expose to public
-  this.startRecording = startRecording
-  this.stopRecording = stopRecording
 
 
   init()
+
 }
