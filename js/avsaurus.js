@@ -386,6 +386,7 @@ function AVSaurus(opts){
         console.log('Sample ended')
         inst.playSound()
       });
+      a.play();
     }
     inst.audioTag = a
   }
